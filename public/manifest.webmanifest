@@ -1,0 +1,18 @@
+{
+  "name": "The Defender's Eye",
+  "short_name": "Bridge",
+  "description": "SAYC bridge companion: HCP counter, auction advisor, card-play helper.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#F2EDE0",
+  "theme_color": "#1F4D3A",
+  "orientation": "portrait-primary",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
