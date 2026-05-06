@@ -565,95 +565,372 @@ function hasInternalSeq(h) {
   return null;
 }
 
-function analyzeSuit(holding, denom, isNT, isTrump, isPartnerSuit, isOppSuit) {
-  const len = holding.length;
-  const reasons = [];
-  let lead = null;
-  let score = 0;
+/* Tunable scoring constants for the opening-lead engine.
+   Pulled into one place so the tradeoffs between shape, philosophy, and
+   auction context are auditable and can be retuned without hunting through
+   the body of analyzeSuit. */
+const LEAD_WEIGHTS = {
+  // Trump treatment (gap #1)
+  trumpHonorSequence: -60,   // KQJ / QJT / KQ / QJ in trump — promotion disaster
+  trumpIsolatedHonor: -25,   // lone honor in trump
+  trumpSmallOnly: -10,       // small-only trump lead — passive but defensible
 
-  if (len === 0) return null;
+  // Suit-contract base shapes (passive-lead philosophy)
+  suitTopOf3Seq: 40,
+  suitInternalSeq: 30,
+  suitAK: 35,
+  suit2HonorSeq: 25,
+  suitSingleton: 35,         // ruff hopes — modulated by partner-pass-through (gap #4)
+  suitDoubleton: 5,
+  suitDoubletonQ: -20,       // gap #3: Qx trap (added on top of suitDoubleton)
+  suitDoubletonJ: -15,       // gap #3: Jx trap
+  suit4ToHonor: 5,
+  suit3ToHonor: -5,
+  suit3Small: 0,
+  suitDefault: -5,
 
-  if (isTrump) {
-    score -= 30;
-    reasons.push('Leading trumps is usually passive — only do it when declarer is cross-ruffing or you want to cut down ruffs.');
-    lead = holding[holding.length - 1];
-  } else if (len === 1 && !isNT) {
-    score += 35;
-    reasons.push(`Singleton ${holding[0]} — strong lead in a suit contract; aiming for a ruff if partner has an entry.`);
-    lead = holding[0];
-  } else if (len === 1 && isNT) {
-    score -= 20;
-    reasons.push('Singleton in NT is usually wrong — you set up declarer\'s long suit.');
-    lead = holding[0];
-  } else if (isSeq(holding.slice(0, 3), 3)) {
-    score += 40;
-    reasons.push(`Top of a 3-card sequence (${holding[0]}${holding[1]}${holding[2]}) — safest and most informative lead.`);
-    lead = holding[0];
-  } else {
-    const internal = hasInternalSeq(holding);
-    if (internal) {
-      score += 30;
-      reasons.push(`Internal sequence — lead the ${internal.seqStart} (top of the inner run, keeping the ${internal.topHonor} as a stopper).`);
-      lead = internal.seqStart;
-    } else if (isSeq(holding.slice(0, 2), 2) && RANK_VAL[holding[0]] >= 11) {
-      score += 25;
-      reasons.push(`Top of a 2-card honor sequence (${holding[0]}${holding[1]}).`);
-      lead = holding[0];
-    } else if (holding[0] === 'A' && holding[1] === 'K') {
-      score += 35;
-      reasons.push('AK combination — in SAYC the standard is to lead the A from AK against suit contracts.');
-      lead = 'A';
-    } else if (len === 2) {
-      score += 5;
-      reasons.push(`Doubleton ${holding[0]}${holding[1]} — top of a doubleton in suit contracts can set up a ruff.`);
-      if (isNT) { score -= 10; reasons.push('In NT a doubleton lead is usually poor unless partner has bid the suit.'); }
-      lead = holding[0];
-    } else if (isNT && len >= 4) {
-      score += 25;
-      lead = holding[3];
-      reasons.push(`4th best from your longest/strongest suit — standard NT lead. Lead the ${lead}.`);
-    } else if (!isNT && len >= 4 && RANK_VAL[holding[0]] >= 11) {
-      score += 5;
-      reasons.push('Long suit with an unsupported honor in a suit contract — often risky; consider another suit if available.');
-      lead = holding[len - 1];
-      reasons.push(`If you must lead this suit, lead low (${lead}) — leading an unsupported honor often gives a trick away.`);
-    } else if (len === 3 && RANK_VAL[holding[0]] >= 11) {
-      score -= 5;
-      reasons.push(`Three to an honor — leading low (${holding[2]}) is the textbook play to avoid blowing a trick.`);
-      lead = holding[2];
-    } else if (len === 3) {
-      score += 0;
-      reasons.push(`Three small (${holding.join('')}) — top of nothing (lead the ${holding[0]}; most pairs treat this as MUD-style or top of three small).`);
-      lead = holding[0];
-    } else {
-      score -= 5;
-      lead = holding[len - 1];
-      reasons.push(`Default — lead low (${lead}).`);
+  // NT base shapes (active-lead philosophy — gap #6)
+  ntTopOf3Seq: 40,
+  ntInternalSeq: 30,
+  ntAK: 15,
+  nt4thBest: 25,
+  nt4ToHonor: 5,             // bonus on top of 4thBest when long suit is honor-topped
+  nt3ToHonor: -5,
+  ntDoubleton: -10,
+  ntSingleton: -20,
+  ntDefault: -10,
+
+  // Auction-context modifiers (gap #2 + gap #5)
+  partnerSuit: 50,
+  declarerSuit: -25,
+  unbidBonus: { 1: 30, 2: 20, 3: 10 },  // bonus for unbid suit, by # of unbid suits remaining
+  defenderTakeoutBonus: 10,             // takeout-shape X by leader's side → partner has unbid suits
+  declarerTakeoutBonus: 5,              // takeout-shape X by declarer's side → declarer has unbid suits
+
+  // Partner-passed-throughout (gap #4)
+  partnerPassSingleton: -20, // ruff hopes evaporate without an entry
+  partnerPassDoubleton: -8,
+};
+
+/* Derive the final contract from a complete auction (last bid before 3 trailing passes).
+   Returns null for in-progress, passed-out, or empty auctions. */
+function deriveContract(auction) {
+  if (auction.length < 4) return null;
+  if (!auction.slice(-3).every((b) => b.type === 'pass')) return null;
+  for (let i = auction.length - 4; i >= 0; i--) {
+    if (auction[i].type === 'bid') return { level: auction[i].level, denom: auction[i].denom };
+  }
+  return null; // passed out
+}
+
+/* Build a rich auction context for the opening-lead engine. Parametric over
+   which seat is on lead (derived from contract); otherwise falls back to South.
+
+   Returns:
+     { contract, declarer, dummy, leaderSeat, partnerSeat, dealer,
+       bidsBySeat, declarerSuits, partnerSuits, leaderSuits, unbidSuits,
+       doubles: { byDefenderSide, byDeclarerSide },
+       partnerPassedThroughout, leaderPassedThroughout,
+       summary: string[] } */
+function deriveLeadContext(auction, dealer, contract) {
+  const dealerIdx = POS_INDEX[dealer];
+  const bidsBySeat = { N: [], E: [], S: [], W: [] };
+  for (let i = 0; i < auction.length; i++) {
+    bidsBySeat[POSITIONS[(dealerIdx + i) % 4]].push(auction[i]);
+  }
+
+  // ---- Declarer + leader (derived from contract) ----
+  let declarer = null, dummy = null, leaderSeat = null, partnerSeat = null;
+  if (contract) {
+    let lastBidIdx = -1;
+    for (let i = auction.length - 1; i >= 0; i--) {
+      if (auction[i].type === 'bid') { lastBidIdx = i; break; }
+    }
+    if (lastBidIdx >= 0) {
+      const lastBidderIdx = (dealerIdx + lastBidIdx) % 4;
+      const declSide = lastBidderIdx % 2; // 0 = NS, 1 = EW
+      for (let i = 0; i < auction.length; i++) {
+        if (auction[i].type !== 'bid') continue;
+        if (auction[i].denom !== contract.denom) continue;
+        const bidderIdx = (dealerIdx + i) % 4;
+        if (bidderIdx % 2 !== declSide) continue;
+        declarer = POSITIONS[bidderIdx];
+        break;
+      }
+      if (!declarer) declarer = POSITIONS[lastBidderIdx];
+      const dIdx = POS_INDEX[declarer];
+      dummy = POSITIONS[(dIdx + 2) % 4];
+      leaderSeat = POSITIONS[(dIdx + 1) % 4];
+      partnerSeat = POSITIONS[(dIdx + 3) % 4];
     }
   }
 
-  if (isPartnerSuit) {
-    score += 50;
-    reasons.unshift('Partner bid this suit — strongly preferred lead. Use your usual leading style: top from a doubleton, low from 3+ to an honor, top from 3 small.');
+  // ---- Sides — relative to leader (or default South) ----
+  const refLeader = leaderSeat || 'S';
+  const refIdx = POS_INDEX[refLeader];
+  const partnerIdxN = (refIdx + 2) % 4;
+
+  const collect = (seats) => {
+    const set = new Set();
+    for (const s of seats) for (const b of bidsBySeat[s]) {
+      if (b.type === 'bid' && b.denom !== 'NT') set.add(b.denom);
+    }
+    return ['S', 'H', 'D', 'C'].filter((d) => set.has(d));
+  };
+  const partnerSuits = collect([POSITIONS[partnerIdxN]]);
+  const leaderSuits = collect([POSITIONS[refIdx]]);
+  const declarerSuits = collect([POSITIONS[(refIdx + 1) % 4], POSITIONS[(refIdx + 3) % 4]]);
+  const allBidSuits = collect(POSITIONS);
+  const unbidSuits = allBidSuits.length > 0
+    ? ['S', 'H', 'D', 'C'].filter((d) => !allBidSuits.includes(d))
+    : []; // no auction info → no unbid signal
+
+  // ---- Doubles classification (takeout-shape heuristic) ----
+  // A double is takeout-shape iff it doubles a 1- or 2-level suit bid AND
+  // the doubler either hadn't bid yet (direct takeout) or had only opened
+  // 1-of-suit (reopening double). Misses negative/support/lead-directing
+  // doubles — those become engine-aware in the v3.5 convention layer.
+  let byDefenderSide = false, byDeclarerSide = false;
+  for (let i = 0; i < auction.length; i++) {
+    const b = auction[i];
+    if (b.type !== 'dbl') continue;
+    let dIdx = -1;
+    for (let j = i - 1; j >= 0; j--) {
+      if (auction[j].type === 'bid') { dIdx = j; break; }
+      if (auction[j].type === 'dbl' || auction[j].type === 'rdbl') break;
+    }
+    if (dIdx < 0) continue;
+    const doubledBid = auction[dIdx];
+    if (doubledBid.denom === 'NT' || doubledBid.level > 2) continue;
+    const doublerIdx = (dealerIdx + i) % 4;
+    const doublerSeat = POSITIONS[doublerIdx];
+    const priorReals = [];
+    for (const x of bidsBySeat[doublerSeat]) {
+      if (x === b) break;
+      if (x.type === 'bid') priorReals.push(x);
+    }
+    const isTakeout = priorReals.length === 0
+      || (priorReals.length === 1 && priorReals[0].level === 1);
+    if (!isTakeout) continue;
+    if (doublerIdx % 2 === refIdx % 2) byDefenderSide = true;
+    else byDeclarerSide = true;
   }
-  if (isOppSuit) {
-    score -= 25;
-    reasons.unshift('Declarer/dummy bid this suit — usually a bad lead unless you have a specific reason.');
+
+  // ---- Pass-through flags ----
+  const partnerBids = bidsBySeat[POSITIONS[partnerIdxN]];
+  const leaderBids = bidsBySeat[POSITIONS[refIdx]];
+  const partnerPassedThroughout = partnerBids.length > 0
+    && partnerBids.every((x) => x.type === 'pass');
+  const leaderPassedThroughout = leaderBids.length > 0
+    && leaderBids.every((x) => x.type === 'pass');
+
+  // ---- Human-readable summary (rendered above the recommendation) ----
+  const summary = [];
+  if (contract && declarer) {
+    const onLead = leaderSeat && leaderSeat !== 'S' ? ` — ${leaderSeat} on lead` : '';
+    summary.push(`Final contract: ${contract.level}${SYM[contract.denom]} by ${declarer}${onLead}`);
+  }
+  if (declarerSuits.length) summary.push(`Declarer side bid: ${declarerSuits.map((s) => SYM[s]).join(' ')}`);
+  if (partnerSuits.length) summary.push(`Partner bid: ${partnerSuits.map((s) => SYM[s]).join(' ')}`);
+  if (unbidSuits.length === 1) summary.push(`Only ${SYM[unbidSuits[0]]} unbid — strong unbid-suit signal`);
+  else if (unbidSuits.length === 2) summary.push(`Unbid: ${unbidSuits.map((s) => SYM[s]).join(' ')}`);
+  if (byDefenderSide) summary.push('Takeout-shape X by defender side — partner suggests length in unbid suits');
+  if (byDeclarerSide) summary.push('Takeout-shape X by declarer side — declarer/dummy suggest length in unbid suits');
+  if (partnerPassedThroughout) {
+    const isNT = contract && contract.denom === 'NT';
+    summary.push(isNT
+      ? 'Partner passed throughout — limited entries for partner'
+      : 'Partner passed throughout — limited entries; ruff-seeking devalued');
+  }
+
+  return {
+    contract, declarer, dummy, leaderSeat, partnerSeat, dealer,
+    bidsBySeat, declarerSuits, partnerSuits, leaderSuits, unbidSuits,
+    doubles: { byDefenderSide, byDeclarerSide },
+    partnerPassedThroughout, leaderPassedThroughout,
+    summary,
+  };
+}
+
+function analyzeSuit(holding, denom, ctx) {
+  const len = holding.length;
+  if (len === 0) return null;
+  const W = LEAD_WEIGHTS;
+  const reasons = [];
+  let lead = null;
+  let score = 0;
+  const top = holding[0];
+
+  // -------- Trump suit treatment (gap #1) --------
+  if (ctx.isTrump) {
+    if (isSeq(holding.slice(0, 3), 3)
+        || (isSeq(holding.slice(0, 2), 2) && RANK_VAL[top] >= 11)) {
+      score += W.trumpHonorSequence;
+      const seqLen = isSeq(holding.slice(0, 3), 3) ? 3 : 2;
+      reasons.push(`Trump suit AND honor sequence (${holding.slice(0, seqLen).join('')}) — leading from this almost certainly promotes declarer's small trumps. Almost always wrong.`);
+      lead = holding[len - 1];
+    } else if (RANK_VAL[top] >= 11) {
+      score += W.trumpIsolatedHonor;
+      reasons.push(`Trump suit with an isolated honor (${top}) — risks giving a trick; lead a small trump if you must.`);
+      lead = holding[len - 1];
+    } else {
+      score += W.trumpSmallOnly;
+      reasons.push('Trump suit, small only — passive trump lead is OK against cross-ruff or to cut down ruffs.');
+      lead = holding[len - 1];
+    }
+  } else if (ctx.isNT) {
+    // -------- NT philosophy (gap #6): active leads, set up your long suit --------
+    if (len === 1) {
+      score += W.ntSingleton;
+      reasons.push("Singleton in NT — usually wrong; sets up declarer's long suit.");
+      lead = top;
+    } else if (len === 2) {
+      score += W.ntDoubleton;
+      reasons.push('Doubleton in NT — generally poor unless partner bid the suit.');
+      lead = top;
+    } else if (isSeq(holding.slice(0, 3), 3)) {
+      score += W.ntTopOf3Seq;
+      reasons.push(`Top of a 3-card sequence (${holding.slice(0, 3).join('')}) — strong NT lead.`);
+      lead = top;
+    } else {
+      const internal = hasInternalSeq(holding);
+      if (internal) {
+        score += W.ntInternalSeq;
+        reasons.push(`Internal sequence — lead the ${internal.seqStart} (inner run; ${internal.topHonor} as stopper).`);
+        lead = internal.seqStart;
+      } else if (top === 'A' && holding[1] === 'K') {
+        score += W.ntAK;
+        reasons.push('AK in NT — leading the A and continuing can establish length tricks.');
+        lead = 'A';
+      } else if (len >= 4) {
+        score += W.nt4thBest;
+        if (RANK_VAL[top] >= 11) score += W.nt4ToHonor;
+        lead = holding[3];
+        reasons.push(`4th best from your longest/strongest suit — the standard NT lead. Lead the ${lead}.`);
+      } else if (len === 3 && RANK_VAL[top] >= 11) {
+        score += W.nt3ToHonor;
+        reasons.push(`Three to an honor in NT — lead low (${holding[2]}) to preserve the honor as a stopper.`);
+        lead = holding[2];
+      } else {
+        score += W.ntDefault;
+        reasons.push(`Three small in NT — top of nothing (${top}); not preferred against NT.`);
+        lead = top;
+      }
+    }
+  } else {
+    // -------- Suit-contract philosophy: passive leads, avoid giving tricks --------
+    if (len === 1) {
+      score += W.suitSingleton;
+      reasons.push(`Singleton ${top} — strong lead in a suit contract; aiming for a ruff if partner has an entry.`);
+      lead = top;
+      if (ctx.partnerPassedThroughout) {
+        score += W.partnerPassSingleton;
+        reasons.push('Partner passed throughout — unlikely to have an entry to give the ruff. Devalued.');
+      }
+    } else if (isSeq(holding.slice(0, 3), 3)) {
+      score += W.suitTopOf3Seq;
+      reasons.push(`Top of a 3-card sequence (${holding.slice(0, 3).join('')}) — safest and most informative lead.`);
+      lead = top;
+    } else {
+      const internal = hasInternalSeq(holding);
+      if (internal) {
+        score += W.suitInternalSeq;
+        reasons.push(`Internal sequence — lead the ${internal.seqStart} (inner run; ${internal.topHonor} as stopper).`);
+        lead = internal.seqStart;
+      } else if (top === 'A' && holding[1] === 'K') {
+        score += W.suitAK;
+        reasons.push('AK combination — SAYC standard is to lead the A from AK against suit contracts.');
+        lead = 'A';
+      } else if (isSeq(holding.slice(0, 2), 2) && RANK_VAL[top] >= 11) {
+        score += W.suit2HonorSeq;
+        reasons.push(`Top of a 2-card honor sequence (${holding.slice(0, 2).join('')}).`);
+        lead = top;
+      } else if (len === 2) {
+        score += W.suitDoubleton;
+        if (top === 'Q') {
+          score += W.suitDoubletonQ;
+          reasons.push(`Doubleton Q${holding[1]} — Qx is a classic trap lead in suit contracts; often costs a trick.`);
+        } else if (top === 'J') {
+          score += W.suitDoubletonJ;
+          reasons.push(`Doubleton J${holding[1]} — Jx can hand declarer a free finesse.`);
+        } else {
+          reasons.push(`Doubleton ${holding.join('')} — top of doubleton can set up a ruff in a suit contract.`);
+        }
+        lead = top;
+        if (ctx.partnerPassedThroughout) {
+          score += W.partnerPassDoubleton;
+          reasons.push('Partner passed throughout — ruff hopes are slim without an entry.');
+        }
+      } else if (len >= 4 && RANK_VAL[top] >= 11) {
+        score += W.suit4ToHonor;
+        lead = holding[len - 1];
+        reasons.push(`Four+ to an unsupported honor — lead low (${lead}); leading the honor often gives a trick.`);
+      } else if (len === 3 && RANK_VAL[top] >= 11) {
+        score += W.suit3ToHonor;
+        reasons.push(`Three to an honor — lead low (${holding[2]}) per textbook.`);
+        lead = holding[2];
+      } else if (len === 3) {
+        score += W.suit3Small;
+        reasons.push(`Three small (${holding.join('')}) — top of nothing; most pairs lead top of three small.`);
+        lead = top;
+      } else {
+        score += W.suitDefault;
+        lead = holding[len - 1];
+        reasons.push(`Default — lead low (${lead}).`);
+      }
+    }
+  }
+
+  // -------- Auction-context modifiers (gap #2, gap #5) --------
+  if (ctx.isPartnerSuit) {
+    score += W.partnerSuit;
+    reasons.unshift('Partner bid this suit — strongly preferred lead.');
+  }
+  if (ctx.isDeclarerSuit) {
+    score += W.declarerSuit;
+    reasons.unshift('Declarer/dummy bid this suit — generally avoid leading it.');
+  }
+  if (ctx.isUnbid && !ctx.isTrump) {
+    const bonus = W.unbidBonus[ctx.unbidCount] || 0;
+    if (bonus > 0) {
+      score += bonus;
+      const label = ctx.unbidCount === 1 ? 'only unbid suit' : `unbid (${ctx.unbidCount} of 4)`;
+      reasons.unshift(`This is the ${label} — a relatively safe lead in a contested auction.`);
+    }
+    if (ctx.defenderTookOut) {
+      score += W.defenderTakeoutBonus;
+      reasons.push('Defender side made a takeout-shape X — partner likely has length here.');
+    }
+    if (ctx.declarerTookOut) {
+      score += W.declarerTakeoutBonus;
+      reasons.push('Declarer side made a takeout-shape X — declarer/dummy hold length here.');
+    }
   }
 
   return { suit: denom, holding, lead, score, reasons };
 }
 
-function recommendOpeningLead({ contract, suits, partnerSuit, oppSuit }) {
+function recommendOpeningLead({ contract, suits, auction = [], dealer = 'N' }) {
+  const leadCtx = deriveLeadContext(auction, dealer, contract);
   const isNT = contract && contract.denom === 'NT';
   const trumpDenom = !isNT && contract ? contract.denom : null;
   const results = [];
   for (const denom of ['S', 'H', 'D', 'C']) {
-    const r = analyzeSuit(suits[denom] || [], denom, isNT, denom === trumpDenom, denom === partnerSuit, denom === oppSuit);
+    const r = analyzeSuit(suits[denom] || [], denom, {
+      isNT,
+      isTrump: denom === trumpDenom,
+      isPartnerSuit: leadCtx.partnerSuits.includes(denom),
+      isDeclarerSuit: leadCtx.declarerSuits.includes(denom),
+      isUnbid: leadCtx.unbidSuits.includes(denom),
+      unbidCount: leadCtx.unbidSuits.length,
+      partnerPassedThroughout: leadCtx.partnerPassedThroughout,
+      defenderTookOut: leadCtx.doubles.byDefenderSide,
+      declarerTookOut: leadCtx.doubles.byDeclarerSide,
+    });
     if (r) results.push(r);
   }
   results.sort((a, b) => b.score - a.score);
-  return { primary: results[0], alternatives: results.slice(1) };
+  return { primary: results[0], alternatives: results.slice(1), contextSummary: leadCtx.summary, leadContext: leadCtx };
 }
 
 /* =========================================================
@@ -1203,11 +1480,9 @@ function ConventionsPanel({ conv, setConv }) {
   );
 }
 
-function BidAdvisor() {
+function BidAdvisor({ auction, setAuction, dealer, setDealer }) {
   const [hand, setHand] = useState({ hcp: null, s: 0, h: 0, d: 0, c: 0 });
-  const [dealer, setDealer] = useState('N');
   const [vul, setVul] = useState('None');
-  const [auction, setAuction] = useState([]);
   const [showLogic, setShowLogic] = useState(true);
   const [conv, setConv] = useState(DEFAULT_CONV);
 
@@ -1383,11 +1658,9 @@ function ContractPicker({ contract, setContract }) {
   );
 }
 
-function LeadHelper() {
+function LeadHelper({ auction, setAuction, dealer, setDealer }) {
   const [contract, setContract] = useState({ level: 3, denom: 'NT' });
   const [holdingsRaw, setHoldingsRaw] = useState({ S: '', H: '', D: '', C: '' });
-  const [partnerSuit, setPartnerSuit] = useState(null);
-  const [oppSuit, setOppSuit] = useState(null);
 
   const suits = useMemo(() => ({
     S: parseHolding(holdingsRaw.S),
@@ -1398,16 +1671,25 @@ function LeadHelper() {
 
   const totalCards = suits.S.length + suits.H.length + suits.D.length + suits.C.length;
 
+  // Auction-derived contract (when 3-pass-out) takes priority over the manual picker.
+  const auctionContract = useMemo(() => deriveContract(auction), [auction]);
+  const effectiveContract = auctionContract || contract;
+
   const result = useMemo(() => {
     if (totalCards === 0) return null;
-    return recommendOpeningLead({ contract, suits, partnerSuit, oppSuit });
-  }, [contract, suits, partnerSuit, oppSuit, totalCards]);
+    return recommendOpeningLead({ contract: effectiveContract, suits, auction, dealer });
+  }, [effectiveContract, suits, auction, dealer, totalCards]);
+
+  const addBid = (b) => setAuction([...auction, b]);
+  const undoBid = () => setAuction(auction.slice(0, -1));
+  const resetAuction = () => setAuction([]);
 
   const reset = () => {
     setHoldingsRaw({ S: '', H: '', D: '', C: '' });
-    setPartnerSuit(null);
-    setOppSuit(null);
   };
+
+  const leaderSeat = result?.leadContext?.leaderSeat;
+  const leaderBanner = leaderSeat && leaderSeat !== 'S';
 
   return (
     <div className="space-y-5">
@@ -1415,11 +1697,17 @@ function LeadHelper() {
         <div className="flex items-center justify-between mb-3">
           <h3 className="display text-xl">Final contract</h3>
           <div className="text-xs data" style={{ color: 'var(--muted)' }}>
-            <span style={{ color: 'var(--ink)' }}>{contract.level}</span>
-            <span className={contract.denom === 'H' || contract.denom === 'D' ? 'red-suit' : 'blk-suit'} style={{ marginLeft: 2 }}>{SYM[contract.denom]}</span>
+            <span style={{ color: 'var(--ink)' }}>{effectiveContract.level}</span>
+            <span className={effectiveContract.denom === 'H' || effectiveContract.denom === 'D' ? 'red-suit' : 'blk-suit'} style={{ marginLeft: 2 }}>{SYM[effectiveContract.denom]}</span>
+            {auctionContract && <span style={{ marginLeft: 8, color: 'var(--felt)' }}>· auto from auction</span>}
           </div>
         </div>
         <ContractPicker contract={contract} setContract={setContract} />
+        {auctionContract && (
+          <div className="mt-2 text-[11px] leading-relaxed" style={{ color: 'var(--muted)' }}>
+            Contract is being read from the auction below. The picker above acts as a fallback when no auction is entered.
+          </div>
+        )}
       </div>
 
       <div className="card-tile rounded-lg p-4">
@@ -1440,41 +1728,52 @@ function LeadHelper() {
       </div>
 
       <div className="card-tile rounded-lg p-4">
-        <div className="text-[10px] uppercase tracking-wider mb-2" style={{ color: 'var(--muted)' }}>Auction context (optional, but improves the recommendation)</div>
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-          <div>
-            <div className="text-xs mb-1.5">Partner bid (suit)</div>
-            <div className="flex gap-1">
-              {[null, 'S', 'H', 'D', 'C'].map((d) => (
-                <button
-                  key={d || 'none'}
-                  onClick={() => setPartnerSuit(d)}
-                  className={`pill-btn rounded-md flex-1 py-2 text-xs ${partnerSuit === d ? 'active' : ''}`}
-                >
-                  {d ? <span className={d === 'H' || d === 'D' ? 'red-suit' : 'blk-suit'}>{SYM[d]}</span> : '—'}
-                </button>
-              ))}
-            </div>
+        <div className="flex items-center justify-between mb-3">
+          <h3 className="display text-xl">Auction</h3>
+          {auction.length > 0 && (
+            <button onClick={resetAuction} className="text-xs flex items-center gap-1" style={{ color: 'var(--muted)' }}>
+              <RotateCcw size={12} /> Clear
+            </button>
+          )}
+        </div>
+        <div className="text-[11px] leading-relaxed mb-3" style={{ color: 'var(--muted)' }}>
+          Shared with the Auction Advisor tab — entering the bidding here sharpens the lead recommendation (unbid suits, takeout doubles, partner pass-throughs).
+        </div>
+        <div className="mb-3">
+          <div className="text-[10px] uppercase tracking-wider mb-1.5" style={{ color: 'var(--muted)' }}>Dealer</div>
+          <div className="flex gap-1">
+            {POSITIONS.map((p) => (
+              <button
+                key={p}
+                onClick={() => { setDealer(p); setAuction([]); }}
+                className={`pill-btn rounded-md flex-1 py-2 display text-base ${dealer === p ? 'active' : ''}`}
+              >{p}</button>
+            ))}
           </div>
-          <div>
-            <div className="text-xs mb-1.5">Declarer/dummy bid (suit)</div>
-            <div className="flex gap-1">
-              {[null, 'S', 'H', 'D', 'C'].map((d) => (
-                <button
-                  key={d || 'none'}
-                  onClick={() => setOppSuit(d)}
-                  className={`pill-btn rounded-md flex-1 py-2 text-xs ${oppSuit === d ? 'active' : ''}`}
-                >
-                  {d ? <span className={d === 'H' || d === 'D' ? 'red-suit' : 'blk-suit'}>{SYM[d]}</span> : '—'}
-                </button>
-              ))}
-            </div>
-          </div>
+        </div>
+        <AuctionDisplay auction={auction} dealer={dealer} onUndo={undoBid} />
+        <div className="mt-3">
+          <BidKeypad auction={auction} addBid={addBid} />
         </div>
       </div>
 
+      {leaderBanner && (
+        <div className="rounded-lg p-3 text-xs leading-relaxed" style={{ background: 'var(--paper-2)', border: '1px solid var(--line)', color: 'var(--ink-soft)' }}>
+          <Info size={12} className="inline -mt-0.5 mr-1" />
+          In this auction <span className="display" style={{ color: 'var(--ink)' }}>{leaderSeat}</span> is on lead. The recommendation below is what you'd lead from this hand — useful for thinking along.
+        </div>
+      )}
+
       {result && result.primary && (
         <div className="recommendation rounded-lg p-4 sm:p-5">
+          {result.contextSummary && result.contextSummary.length > 0 && (
+            <div className="mb-3 pb-3" style={{ borderBottom: '1px solid var(--line-soft)' }}>
+              <div className="text-[10px] uppercase tracking-wider mb-1.5" style={{ color: 'var(--muted)' }}>Auction context</div>
+              <ul className="text-xs leading-relaxed space-y-0.5" style={{ color: 'var(--ink-soft)' }}>
+                {result.contextSummary.map((s, i) => <li key={i}>· {s}</li>)}
+              </ul>
+            </div>
+          )}
           <div className="text-xs uppercase tracking-[0.2em] mb-2" style={{ color: 'var(--burgundy)' }}>Suggested lead</div>
           <div className="display text-3xl sm:text-4xl mb-2">
             <span className="data">{result.primary.lead === 'T' ? '10' : result.primary.lead}</span>
@@ -1491,11 +1790,11 @@ function LeadHelper() {
             ))}
           </ul>
 
-          {result.alternatives.filter((a) => a.score > -10).length > 0 && (
+          {result.alternatives.filter((a) => a.score > -15).length > 0 && (
             <div className="mt-4 pt-3" style={{ borderTop: '1px solid var(--line-soft)' }}>
               <div className="text-[10px] uppercase tracking-wider mb-2" style={{ color: 'var(--muted)' }}>Alternatives</div>
               <div className="space-y-1.5">
-                {result.alternatives.filter((a) => a.score > -10).slice(0, 3).map((alt, i) => (
+                {result.alternatives.filter((a) => a.score > -15).slice(0, 3).map((alt, i) => (
                   <div key={i} className="text-xs flex items-baseline gap-2" style={{ color: 'var(--ink-soft)' }}>
                     <span className="data">
                       {alt.lead === 'T' ? '10' : alt.lead}
@@ -1520,7 +1819,7 @@ function LeadHelper() {
 
       <div className="text-xs leading-relaxed" style={{ color: 'var(--muted)' }}>
         <Info size={12} className="inline -mt-0.5 mr-1" />
-        Heuristic — applies standard SAYC opening-lead rules (4th best, top of sequence, MUD-style top of three small, etc.). It does not run a double-dummy search; on tricky layouts a real bridge AI may disagree.
+        Heuristic — applies SAYC opening-lead rules plus auction-context inference (trump-promotion risk, doubleton-honor traps, unbid suits, takeout doubles, partner pass-throughs). It does not run a double-dummy search; on tricky layouts a real bridge AI may disagree.
       </div>
     </div>
   );
@@ -1590,16 +1889,16 @@ function DeclarerPlan() {
   );
 }
 
-function CardPlayTab() {
+function CardPlayTab({ auction, setAuction, dealer, setDealer }) {
   return (
     <div className="space-y-6">
       <div>
         <h2 className="display text-2xl mb-1">Opening lead helper</h2>
         <div className="text-sm" style={{ color: 'var(--muted)' }}>
-          Enter the contract and your hand. The engine ranks the four suits using SAYC lead rules.
+          Enter the contract, your hand, and the auction. The engine ranks the four suits using SAYC lead rules and the auction context.
         </div>
       </div>
-      <LeadHelper />
+      <LeadHelper auction={auction} setAuction={setAuction} dealer={dealer} setDealer={setDealer} />
 
       <div className="pt-2">
         <h2 className="display text-2xl mb-3">Reference</h2>
@@ -1630,6 +1929,10 @@ function CardPlayTab() {
 
 export default function BridgeTool() {
   const [tab, setTab] = useState('counter');
+  // Auction + dealer are lifted to root so the Auction Advisor and Card Play
+  // tabs share a single source of truth — switching tabs preserves the auction.
+  const [auction, setAuction] = useState([]);
+  const [dealer, setDealer] = useState('N');
 
   return (
     <div className="bridge-app">
@@ -1677,12 +1980,12 @@ export default function BridgeTool() {
           </div>
 
           {tab === 'counter' && <PointsCounter />}
-          {tab === 'bidder' && <BidAdvisor />}
-          {tab === 'play' && <CardPlayTab />}
+          {tab === 'bidder' && <BidAdvisor auction={auction} setAuction={setAuction} dealer={dealer} setDealer={setDealer} />}
+          {tab === 'play' && <CardPlayTab auction={auction} setAuction={setAuction} dealer={dealer} setDealer={setDealer} />}
 
           <footer className="mt-12 pt-6 text-xs" style={{ borderTop: '1px solid var(--line-soft)', color: 'var(--muted)' }}>
             <div className="flex justify-between flex-wrap gap-2">
-              <span>Standard American Yellow Card · v2.1 · Mobile PWA</span>
+              <span>Standard American Yellow Card · v2.2 · Mobile PWA</span>
               <span className="display italic">play your cards close</span>
             </div>
           </footer>
