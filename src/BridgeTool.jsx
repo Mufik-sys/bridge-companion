@@ -1,5 +1,16 @@
 import { useState, useMemo } from 'react';
-import { RotateCcw, Undo2, Info, ChevronDown, ChevronUp, Settings2 } from 'lucide-react';
+import { RotateCcw, Info, Settings2, ChevronDown, ChevronUp } from 'lucide-react';
+import {
+  DENOMS, SYM, SUIT_LIST, POSITIONS, POS_INDEX,
+  RANK_VAL, PlayerColors,
+  parseHolding, isSeq, hasInternalSeq,
+  deriveContract, deriveLeadContext,
+} from './sharedHelpers.js';
+import {
+  HonorTile, AuctionDisplay, BidKeypad, Toggle, Collapsible,
+  SuitInput, ContractPicker,
+} from './uiComponents.jsx';
+import LivePlayTab from './LivePlayTab.jsx';
 
 /* Default conventions — both on by user's selection */
 const DEFAULT_CONV = { jacobyTransfers: true, newMinorForcing: true };
@@ -7,50 +18,6 @@ const DEFAULT_CONV = { jacobyTransfers: true, newMinorForcing: true };
 /* =========================================================
    SAYC BIDDING ENGINE
    ========================================================= */
-
-const DENOMS = ['C', 'D', 'H', 'S', 'NT'];
-const SYM = { C: '♣', D: '♦', H: '♥', S: '♠', NT: 'NT' };
-const SUIT_LIST = ['S', 'H', 'D', 'C'];
-const POSITIONS = ['N', 'E', 'S', 'W']; // clockwise
-const POS_INDEX = { N: 0, E: 1, S: 2, W: 3 };
-
-const bidValue = (b) => (b.type !== 'bid' ? -1 : b.level * 5 + DENOMS.indexOf(b.denom));
-
-const lastSuitBid = (auction) => {
-  for (let i = auction.length - 1; i >= 0; i--) if (auction[i].type === 'bid') return auction[i];
-  return null;
-};
-
-const isLegalBid = (bid, auction) => {
-  if (bid.type === 'pass') return true;
-  if (bid.type === 'bid') {
-    const last = lastSuitBid(auction);
-    return !last || bidValue(bid) > bidValue(last);
-  }
-  if (bid.type === 'dbl') {
-    for (let i = auction.length - 1; i >= 0; i--) {
-      if (auction[i].type === 'bid') return true;
-      if (auction[i].type === 'dbl' || auction[i].type === 'rdbl') return false;
-    }
-    return false;
-  }
-  if (bid.type === 'rdbl') {
-    for (let i = auction.length - 1; i >= 0; i--) {
-      if (auction[i].type === 'dbl') return true;
-      if (auction[i].type === 'bid' || auction[i].type === 'rdbl') return false;
-    }
-    return false;
-  }
-  return false;
-};
-
-const bidLabel = (b) => {
-  if (!b) return '';
-  if (b.type === 'pass') return 'Pass';
-  if (b.type === 'dbl') return 'X';
-  if (b.type === 'rdbl') return 'XX';
-  return `${b.level}${SYM[b.denom]}`;
-};
 
 const isBalanced = (s, h, d, c) => {
   const sorted = [s, h, d, c].sort((a, b) => b - a);
@@ -529,42 +496,6 @@ function getRecommendation(hand, auction, dealer, conv = DEFAULT_CONV) {
    OPENING-LEAD ENGINE — heuristic guidance, not a card-play AI
    ========================================================= */
 
-const RANK_VAL = { A: 14, K: 13, Q: 12, J: 11, T: 10, '9': 9, '8': 8, '7': 7, '6': 6, '5': 5, '4': 4, '3': 3, '2': 2 };
-const NORM_RANK = { 'A': 'A', 'K': 'K', 'Q': 'Q', 'J': 'J', 'T': 'T', '10': 'T', '9': '9', '8': '8', '7': '7', '6': '6', '5': '5', '4': '4', '3': '3', '2': '2' };
-
-function parseHolding(str) {
-  if (!str) return [];
-  const s = str.toUpperCase().replace(/\s/g, '');
-  const out = [];
-  let i = 0;
-  while (i < s.length) {
-    if (i + 1 < s.length && s[i] === '1' && s[i + 1] === '0') { out.push('T'); i += 2; continue; }
-    const ch = s[i];
-    if (NORM_RANK[ch]) out.push(NORM_RANK[ch]);
-    i += 1;
-  }
-  out.sort((a, b) => RANK_VAL[b] - RANK_VAL[a]);
-  return out;
-}
-
-function isSeq(holding, n) {
-  if (holding.length < n) return false;
-  for (let i = 0; i < n - 1; i++) {
-    if (RANK_VAL[holding[i]] - RANK_VAL[holding[i + 1]] !== 1) return false;
-  }
-  return true;
-}
-
-function hasInternalSeq(h) {
-  if (h.length < 4) return null;
-  const top = h[0];
-  const seq = h.slice(1, 4);
-  if (RANK_VAL[top] - RANK_VAL[seq[0]] >= 2 && isSeq(seq, 3)) {
-    return { topHonor: top, seqStart: seq[0] };
-  }
-  return null;
-}
-
 /* Tunable scoring constants for the opening-lead engine.
    Pulled into one place so the tradeoffs between shape, philosophy, and
    auction context are auditable and can be retuned without hunting through
@@ -614,144 +545,6 @@ const LEAD_WEIGHTS = {
 
 /* Derive the final contract from a complete auction (last bid before 3 trailing passes).
    Returns null for in-progress, passed-out, or empty auctions. */
-function deriveContract(auction) {
-  if (auction.length < 4) return null;
-  if (!auction.slice(-3).every((b) => b.type === 'pass')) return null;
-  for (let i = auction.length - 4; i >= 0; i--) {
-    if (auction[i].type === 'bid') return { level: auction[i].level, denom: auction[i].denom };
-  }
-  return null; // passed out
-}
-
-/* Build a rich auction context for the opening-lead engine. Parametric over
-   which seat is on lead (derived from contract); otherwise falls back to South.
-
-   Returns:
-     { contract, declarer, dummy, leaderSeat, partnerSeat, dealer,
-       bidsBySeat, declarerSuits, partnerSuits, leaderSuits, unbidSuits,
-       doubles: { byDefenderSide, byDeclarerSide },
-       partnerPassedThroughout, leaderPassedThroughout,
-       summary: string[] } */
-function deriveLeadContext(auction, dealer, contract) {
-  const dealerIdx = POS_INDEX[dealer];
-  const bidsBySeat = { N: [], E: [], S: [], W: [] };
-  for (let i = 0; i < auction.length; i++) {
-    bidsBySeat[POSITIONS[(dealerIdx + i) % 4]].push(auction[i]);
-  }
-
-  // ---- Declarer + leader (derived from contract) ----
-  let declarer = null, dummy = null, leaderSeat = null, partnerSeat = null;
-  if (contract) {
-    let lastBidIdx = -1;
-    for (let i = auction.length - 1; i >= 0; i--) {
-      if (auction[i].type === 'bid') { lastBidIdx = i; break; }
-    }
-    if (lastBidIdx >= 0) {
-      const lastBidderIdx = (dealerIdx + lastBidIdx) % 4;
-      const declSide = lastBidderIdx % 2; // 0 = NS, 1 = EW
-      for (let i = 0; i < auction.length; i++) {
-        if (auction[i].type !== 'bid') continue;
-        if (auction[i].denom !== contract.denom) continue;
-        const bidderIdx = (dealerIdx + i) % 4;
-        if (bidderIdx % 2 !== declSide) continue;
-        declarer = POSITIONS[bidderIdx];
-        break;
-      }
-      if (!declarer) declarer = POSITIONS[lastBidderIdx];
-      const dIdx = POS_INDEX[declarer];
-      dummy = POSITIONS[(dIdx + 2) % 4];
-      leaderSeat = POSITIONS[(dIdx + 1) % 4];
-      partnerSeat = POSITIONS[(dIdx + 3) % 4];
-    }
-  }
-
-  // ---- Sides — relative to leader (or default South) ----
-  const refLeader = leaderSeat || 'S';
-  const refIdx = POS_INDEX[refLeader];
-  const partnerIdxN = (refIdx + 2) % 4;
-
-  const collect = (seats) => {
-    const set = new Set();
-    for (const s of seats) for (const b of bidsBySeat[s]) {
-      if (b.type === 'bid' && b.denom !== 'NT') set.add(b.denom);
-    }
-    return ['S', 'H', 'D', 'C'].filter((d) => set.has(d));
-  };
-  const partnerSuits = collect([POSITIONS[partnerIdxN]]);
-  const leaderSuits = collect([POSITIONS[refIdx]]);
-  const declarerSuits = collect([POSITIONS[(refIdx + 1) % 4], POSITIONS[(refIdx + 3) % 4]]);
-  const allBidSuits = collect(POSITIONS);
-  const unbidSuits = allBidSuits.length > 0
-    ? ['S', 'H', 'D', 'C'].filter((d) => !allBidSuits.includes(d))
-    : []; // no auction info → no unbid signal
-
-  // ---- Doubles classification (takeout-shape heuristic) ----
-  // A double is takeout-shape iff it doubles a 1- or 2-level suit bid AND
-  // the doubler either hadn't bid yet (direct takeout) or had only opened
-  // 1-of-suit (reopening double). Misses negative/support/lead-directing
-  // doubles — those become engine-aware in the v3.5 convention layer.
-  let byDefenderSide = false, byDeclarerSide = false;
-  for (let i = 0; i < auction.length; i++) {
-    const b = auction[i];
-    if (b.type !== 'dbl') continue;
-    let dIdx = -1;
-    for (let j = i - 1; j >= 0; j--) {
-      if (auction[j].type === 'bid') { dIdx = j; break; }
-      if (auction[j].type === 'dbl' || auction[j].type === 'rdbl') break;
-    }
-    if (dIdx < 0) continue;
-    const doubledBid = auction[dIdx];
-    if (doubledBid.denom === 'NT' || doubledBid.level > 2) continue;
-    const doublerIdx = (dealerIdx + i) % 4;
-    const doublerSeat = POSITIONS[doublerIdx];
-    const priorReals = [];
-    for (const x of bidsBySeat[doublerSeat]) {
-      if (x === b) break;
-      if (x.type === 'bid') priorReals.push(x);
-    }
-    const isTakeout = priorReals.length === 0
-      || (priorReals.length === 1 && priorReals[0].level === 1);
-    if (!isTakeout) continue;
-    if (doublerIdx % 2 === refIdx % 2) byDefenderSide = true;
-    else byDeclarerSide = true;
-  }
-
-  // ---- Pass-through flags ----
-  const partnerBids = bidsBySeat[POSITIONS[partnerIdxN]];
-  const leaderBids = bidsBySeat[POSITIONS[refIdx]];
-  const partnerPassedThroughout = partnerBids.length > 0
-    && partnerBids.every((x) => x.type === 'pass');
-  const leaderPassedThroughout = leaderBids.length > 0
-    && leaderBids.every((x) => x.type === 'pass');
-
-  // ---- Human-readable summary (rendered above the recommendation) ----
-  const summary = [];
-  if (contract && declarer) {
-    const onLead = leaderSeat && leaderSeat !== 'S' ? ` — ${leaderSeat} on lead` : '';
-    summary.push(`Final contract: ${contract.level}${SYM[contract.denom]} by ${declarer}${onLead}`);
-  }
-  if (declarerSuits.length) summary.push(`Declarer side bid: ${declarerSuits.map((s) => SYM[s]).join(' ')}`);
-  if (partnerSuits.length) summary.push(`Partner bid: ${partnerSuits.map((s) => SYM[s]).join(' ')}`);
-  if (unbidSuits.length === 1) summary.push(`Only ${SYM[unbidSuits[0]]} unbid — strong unbid-suit signal`);
-  else if (unbidSuits.length === 2) summary.push(`Unbid: ${unbidSuits.map((s) => SYM[s]).join(' ')}`);
-  if (byDefenderSide) summary.push('Takeout-shape X by defender side — partner suggests length in unbid suits');
-  if (byDeclarerSide) summary.push('Takeout-shape X by declarer side — declarer/dummy suggest length in unbid suits');
-  if (partnerPassedThroughout) {
-    const isNT = contract && contract.denom === 'NT';
-    summary.push(isNT
-      ? 'Partner passed throughout — limited entries for partner'
-      : 'Partner passed throughout — limited entries; ruff-seeking devalued');
-  }
-
-  return {
-    contract, declarer, dummy, leaderSeat, partnerSeat, dealer,
-    bidsBySeat, declarerSuits, partnerSuits, leaderSuits, unbidSuits,
-    doubles: { byDefenderSide, byDeclarerSide },
-    partnerPassedThroughout, leaderPassedThroughout,
-    summary,
-  };
-}
-
 function analyzeSuit(holding, denom, ctx) {
   const len = holding.length;
   if (len === 0) return null;
@@ -1019,29 +812,6 @@ const styles = `
    COMPONENTS
    ========================================================= */
 
-const PlayerColors = {
-  N: { bg: '#1C1814', fg: '#FBF8EE', label: 'N' },
-  E: { bg: '#7A1F2A', fg: '#FBF8EE', label: 'E' },
-  S: { bg: '#1F4D3A', fg: '#FBF8EE', label: 'S' },
-  W: { bg: '#B8924D', fg: '#1C1814', label: 'W' },
-};
-
-function HonorTile({ rank, suit, owner, onClick }) {
-  const isRed = suit === '♥' || suit === '♦';
-  const ownerStyle = owner ? { background: PlayerColors[owner].bg, color: PlayerColors[owner].fg } : { background: 'var(--paper)', color: 'var(--ink)' };
-  return (
-    <button
-      onClick={onClick}
-      className="card-tile flex flex-col items-center justify-center rounded-md py-2 px-1 text-center"
-      style={{ ...ownerStyle, minHeight: 60 }}
-    >
-      <div className="display text-xl leading-none">{rank}</div>
-      <div className={`text-base leading-tight ${owner ? '' : isRed ? 'red-suit' : 'blk-suit'}`}>{suit}</div>
-      <div className="data text-[10px] uppercase tracking-wider opacity-70 mt-0.5">{owner || '—'}</div>
-    </button>
-  );
-}
-
 function PointsCounter() {
   const HONORS = ['A', 'K', 'Q', 'J'];
   const SUITS_DISPLAY = ['♠', '♥', '♦', '♣'];
@@ -1288,175 +1058,6 @@ function HandInput({ hand, setHand }) {
   );
 }
 
-function AuctionDisplay({ auction, dealer, onUndo }) {
-  const dealerIdx = POS_INDEX[dealer];
-  // Build rows of 4 (W N E S left to right? convention: order columns by N E S W or by dealer first)
-  // We'll order columns as N E S W left-to-right, with leading blanks before dealer
-  const cells = [];
-  for (let i = 0; i < dealerIdx; i++) cells.push(null);
-  for (const b of auction) cells.push(b);
-  while (cells.length % 4 !== 0) cells.push(null);
-
-  const rows = [];
-  for (let i = 0; i < cells.length; i += 4) rows.push(cells.slice(i, i + 4));
-
-  const turnIdx = (dealerIdx + auction.length) % 4;
-
-  return (
-    <div className="card-tile rounded-lg overflow-hidden">
-      <div className="grid grid-cols-4 text-xs uppercase tracking-wider data" style={{ borderBottom: '1px solid var(--line)' }}>
-        {POSITIONS.map((p, i) => (
-          <div key={p} className="p-2 text-center" style={{
-            color: i === turnIdx && auction.length < 200 ? 'var(--paper)' : 'var(--muted)',
-            background: i === turnIdx && auction.length < 200 ? PlayerColors[p].bg : 'transparent',
-          }}>
-            {p}{p === dealer ? ' •' : ''}
-          </div>
-        ))}
-      </div>
-      <div className="p-1">
-        {rows.length === 0 ? (
-          <div className="p-4 text-center text-sm" style={{ color: 'var(--muted)' }}>
-            Auction begins with <span className="display text-base" style={{ color: PlayerColors[dealer].bg }}>{dealer}</span>.
-          </div>
-        ) : (
-          rows.map((row, ri) => (
-            <div key={ri} className="grid grid-cols-4">
-              {row.map((b, ci) => {
-                const isMyBid = ci === POS_INDEX.S && b;
-                return (
-                  <div
-                    key={ci}
-                    className="p-2 text-center display text-base"
-                    style={{
-                      color: b ? (isMyBid ? 'var(--felt)' : 'var(--ink)') : 'var(--muted)',
-                      background: ri % 2 === 0 ? 'transparent' : 'var(--paper-2)',
-                    }}
-                  >
-                    {b ? bidLabel(b) : '·'}
-                  </div>
-                );
-              })}
-            </div>
-          ))
-        )}
-      </div>
-      {auction.length > 0 && (
-        <div className="px-2 py-2 flex justify-end" style={{ borderTop: '1px solid var(--line-soft)' }}>
-          <button onClick={onUndo} className="pill-btn rounded-full px-3 py-1 text-xs flex items-center gap-1.5">
-            <Undo2 size={12} /> Undo last
-          </button>
-        </div>
-      )}
-    </div>
-  );
-}
-
-function BidKeypad({ auction, addBid }) {
-  const last = lastSuitBid(auction);
-  const minLevel = last ? (DENOMS.indexOf(last.denom) === 4 ? last.level + 1 : last.level) : 1;
-  const minDenomIdx = last && last.level === minLevel ? DENOMS.indexOf(last.denom) + 1 : 0;
-
-  const tryBid = (level, denom) => {
-    const b = { type: 'bid', level, denom };
-    if (isLegalBid(b, auction)) addBid(b);
-  };
-
-  return (
-    <div className="space-y-2">
-      <div className="flex gap-2 flex-wrap">
-        <button onClick={() => addBid({ type: 'pass' })} className="pill-btn rounded-md px-4 py-2 text-sm flex-1 min-w-[80px]">Pass</button>
-        <button
-          onClick={() => isLegalBid({ type: 'dbl' }, auction) && addBid({ type: 'dbl' })}
-          disabled={!isLegalBid({ type: 'dbl' }, auction)}
-          className="chip-btn rounded-md px-4 py-2 text-sm flex-1 min-w-[80px]"
-          style={{ color: 'var(--burgundy)' }}
-        >X (Dbl)</button>
-        <button
-          onClick={() => isLegalBid({ type: 'rdbl' }, auction) && addBid({ type: 'rdbl' })}
-          disabled={!isLegalBid({ type: 'rdbl' }, auction)}
-          className="chip-btn rounded-md px-4 py-2 text-sm flex-1 min-w-[80px]"
-          style={{ color: 'var(--felt)' }}
-        >XX</button>
-      </div>
-      <div className="grid grid-cols-5 gap-1">
-        {[1, 2, 3, 4, 5, 6, 7].map((lvl) =>
-          DENOMS.map((d) => {
-            const b = { type: 'bid', level: lvl, denom: d };
-            const ok = isLegalBid(b, auction);
-            const red = d === 'H' || d === 'D';
-            return (
-              <button
-                key={`${lvl}${d}`}
-                onClick={() => tryBid(lvl, d)}
-                disabled={!ok}
-                className="chip-btn rounded-md py-2.5 text-sm data"
-              >
-                <span>{lvl}</span>
-                <span className={red ? 'red-suit' : 'blk-suit'} style={{ marginLeft: 1 }}>{SYM[d]}</span>
-              </button>
-            );
-          })
-        )}
-      </div>
-    </div>
-  );
-}
-
-/* Small reusable UI primitives */
-function Toggle({ checked, onChange, label }) {
-  return (
-    <button
-      onClick={() => onChange(!checked)}
-      className="flex items-center justify-between w-full py-2 px-3 text-left rounded card-tile"
-      style={{ borderColor: checked ? 'var(--felt)' : 'var(--line)' }}
-    >
-      <span className="text-sm">{label}</span>
-      <span
-        className="relative inline-block"
-        style={{
-          width: 36, height: 20, borderRadius: 999,
-          background: checked ? 'var(--felt)' : 'var(--line)',
-          transition: 'background 120ms ease',
-        }}
-      >
-        <span
-          className="absolute"
-          style={{
-            top: 2, left: checked ? 18 : 2,
-            width: 16, height: 16, borderRadius: 999,
-            background: 'var(--paper)',
-            transition: 'left 120ms ease',
-            boxShadow: '0 1px 2px rgba(0,0,0,0.1)',
-          }}
-        />
-      </span>
-    </button>
-  );
-}
-
-function Collapsible({ title, icon, defaultOpen = false, children }) {
-  const [open, setOpen] = useState(defaultOpen);
-  return (
-    <div className="card-tile rounded-lg overflow-hidden">
-      <button
-        onClick={() => setOpen(!open)}
-        className="w-full flex items-center justify-between p-3 text-left"
-      >
-        <div className="flex items-center gap-2">
-          {icon}
-          <span className="display text-base">{title}</span>
-        </div>
-        {open ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
-      </button>
-      {open && (
-        <div className="px-4 pb-4 pt-1" style={{ borderTop: '1px solid var(--line-soft)' }}>
-          {children}
-        </div>
-      )}
-    </div>
-  );
-}
 
 function ConventionsPanel({ conv, setConv }) {
   return (
@@ -1605,58 +1206,6 @@ function BidAdvisor({ auction, setAuction, dealer, setDealer }) {
 /* =========================================================
    CARD-PLAY HELPERS — heuristic, not a card-play AI
    ========================================================= */
-
-function SuitInput({ suit, value, onChange }) {
-  const isRed = suit === 'H' || suit === 'D';
-  return (
-    <div className="flex items-center gap-2">
-      <span className={`text-xl w-6 text-center ${isRed ? 'red-suit' : 'blk-suit'}`}>{SYM[suit]}</span>
-      <input
-        type="text"
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-        placeholder="e.g. AKQ72 or T9 or —"
-        className="flex-1 card-tile rounded px-3 py-2 text-base data bg-transparent outline-none"
-      />
-    </div>
-  );
-}
-
-function ContractPicker({ contract, setContract }) {
-  return (
-    <div className="space-y-2">
-      <div>
-        <div className="text-[10px] uppercase tracking-wider mb-1.5" style={{ color: 'var(--muted)' }}>Level</div>
-        <div className="flex gap-1">
-          {[1, 2, 3, 4, 5, 6, 7].map((lvl) => (
-            <button
-              key={lvl}
-              onClick={() => setContract({ ...contract, level: lvl })}
-              className={`pill-btn rounded-md flex-1 py-2.5 data text-sm ${contract.level === lvl ? 'active' : ''}`}
-            >{lvl}</button>
-          ))}
-        </div>
-      </div>
-      <div>
-        <div className="text-[10px] uppercase tracking-wider mb-1.5" style={{ color: 'var(--muted)' }}>Strain</div>
-        <div className="flex gap-1">
-          {DENOMS.map((d) => {
-            const red = d === 'H' || d === 'D';
-            return (
-              <button
-                key={d}
-                onClick={() => setContract({ ...contract, denom: d })}
-                className={`pill-btn rounded-md flex-1 py-2.5 ${contract.denom === d ? 'active' : ''}`}
-              >
-                <span className={red ? 'red-suit' : 'blk-suit'}>{SYM[d]}</span>
-              </button>
-            );
-          })}
-        </div>
-      </div>
-    </div>
-  );
-}
 
 function LeadHelper({ auction, setAuction, dealer, setDealer }) {
   const [contract, setContract] = useState({ level: 3, denom: 'NT' });
@@ -1977,15 +1526,23 @@ export default function BridgeTool() {
             >
               Card Play
             </button>
+            <button
+              onClick={() => setTab('live')}
+              className={`px-4 py-2 rounded-md text-sm transition ${tab === 'live' ? 'active' : ''}`}
+              style={tab === 'live' ? { background: 'var(--ink)', color: 'var(--paper)' } : { color: 'var(--ink-soft)' }}
+            >
+              Live Play
+            </button>
           </div>
 
           {tab === 'counter' && <PointsCounter />}
           {tab === 'bidder' && <BidAdvisor auction={auction} setAuction={setAuction} dealer={dealer} setDealer={setDealer} />}
           {tab === 'play' && <CardPlayTab auction={auction} setAuction={setAuction} dealer={dealer} setDealer={setDealer} />}
+          {tab === 'live' && <LivePlayTab auction={auction} dealer={dealer} />}
 
           <footer className="mt-12 pt-6 text-xs" style={{ borderTop: '1px solid var(--line-soft)', color: 'var(--muted)' }}>
             <div className="flex justify-between flex-wrap gap-2">
-              <span>Standard American Yellow Card · v2.2 · Mobile PWA</span>
+              <span>Standard American Yellow Card · v2.3 · Mobile PWA</span>
               <span className="display italic">play your cards close</span>
             </div>
           </footer>
