@@ -347,32 +347,33 @@ function propagate(c, { tricksPlayedBySeat, unseenBySuit }) {
     }
 
     // ---- Per-suit unseen cross-seat constraint ----
+    // BUGFIX v2.3.1: only sum over UNKNOWN seats (minLen < maxLen).
+    // Fully-known seats (South, dummy if entered) have their cards in c.seen,
+    // so unseenBySuit excludes them. Including their lengths in the sum would
+    // double-count and over-tighten the unknown seats' bounds — reproduced in
+    // the v2.2 failure case where E's clubs.maxLen incorrectly dropped to 2,
+    // then to 0 after a couple of plays, blocking valid follow-suit taps.
     for (const suit of SUITS) {
       const unseen = unseenBySuit[suit];
-      // Unknown seats only — fully-known seats contribute their actual length
-      const seatMaxes = POSITIONS.map((p) => c[p][suit].maxLen);
-      const seatMins = POSITIONS.map((p) => c[p][suit].minLen);
-      const totalMax = seatMaxes.reduce((a, b) => a + b, 0);
-      const totalMin = seatMins.reduce((a, b) => a + b, 0);
+      const unknownSeats = POSITIONS.filter((p) => c[p][suit].minLen < c[p][suit].maxLen);
+      if (unknownSeats.length === 0) continue;
 
-      // For each seat: minLen >= unseen - sum of others' max
-      for (let i = 0; i < 4; i++) {
-        const seat = POSITIONS[i];
-        // If this seat is fully known (S, dummy), skip
-        if (c[seat][suit].minLen === c[seat][suit].maxLen) continue;
-        const otherMaxSum = totalMax - seatMaxes[i];
-        const newMin = Math.max(c[seat][suit].minLen, unseen - otherMaxSum);
+      const ukMaxSum = unknownSeats.reduce((s, p) => s + c[p][suit].maxLen, 0);
+      const ukMinSum = unknownSeats.reduce((s, p) => s + c[p][suit].minLen, 0);
+
+      for (const seat of unknownSeats) {
+        const othersMax = ukMaxSum - c[seat][suit].maxLen;
+        const othersMin = ukMinSum - c[seat][suit].minLen;
+
+        const newMin = Math.max(c[seat][suit].minLen, unseen - othersMax);
         if (newMin > c[seat][suit].minLen) {
           c[seat][suit].minLen = newMin;
           changed = true;
-          seatMins[i] = newMin;
         }
-        const otherMinSum = totalMin - seatMins[i];
-        const newMax = Math.min(c[seat][suit].maxLen, unseen - otherMinSum);
+        const newMax = Math.min(c[seat][suit].maxLen, unseen - othersMin);
         if (newMax < c[seat][suit].maxLen && newMax >= c[seat][suit].minLen) {
           c[seat][suit].maxLen = newMax;
           changed = true;
-          seatMaxes[i] = newMax;
         }
       }
     }

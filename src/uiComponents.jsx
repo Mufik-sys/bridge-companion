@@ -235,13 +235,17 @@ export function ContractPicker({ contract, setContract }) {
         <div className="flex gap-1">
           {DENOMS.map((d) => {
             const red = d === 'H' || d === 'D';
+            const isActive = contract.denom === d;
+            // When active, the button has a dark background — the suit symbol must
+            // override its red-suit/blk-suit class color so it stays readable.
+            const symStyle = isActive ? { color: 'var(--paper)' } : undefined;
             return (
               <button
                 key={d}
                 onClick={() => setContract({ ...contract, denom: d })}
-                className={`pill-btn rounded-md flex-1 py-2.5 ${contract.denom === d ? 'active' : ''}`}
+                className={`pill-btn rounded-md flex-1 py-2.5 ${isActive ? 'active' : ''}`}
               >
-                <span className={red ? 'red-suit' : 'blk-suit'}>{SYM[d]}</span>
+                <span className={red ? 'red-suit' : 'blk-suit'} style={symStyle}>{SYM[d]}</span>
               </button>
             );
           })}

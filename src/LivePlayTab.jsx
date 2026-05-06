@@ -302,7 +302,11 @@ function PlayView({ deal, setDeal, auction, dealer, effectiveContract, effective
       dummySeat: dummyCards ? dummySeat : null,
       auction, dealer, leadContext: lc,
     });
-    // Replay all completed tricks
+    // Replay all completed tricks. BUGFIX v2.3.1: increment tricksPlayedBySeat
+    // per CARD, not per trick-winner. Each seat plays one card per trick, so
+    // all four counts should advance together. The previous "winner only"
+    // tracking left non-winning seats with stale 0 counts, biasing the
+    // per-seat length propagator.
     const tricksPlayedBySeat = { N: 0, E: 0, S: 0, W: 0 };
     let unseen = unseenCountBySuit(c);
     for (const trick of deal.tricks) {
@@ -310,15 +314,16 @@ function PlayView({ deal, setDeal, auction, dealer, effectiveContract, effective
       for (const p of trick.plays) {
         c = applyPlay(c, { seat: p.seat, card: p.card }, tempTrick, tricksPlayedBySeat, unseen);
         tempTrick.plays.push(p);
+        tricksPlayedBySeat[p.seat]++;
         unseen = unseenCountBySuit(c);
       }
-      tricksPlayedBySeat[trick.winner]++;
     }
     // Replay current (incomplete) trick
     const tempTrick = { leader: deal.currentTrick.leader, plays: [] };
     for (const p of deal.currentTrick.plays) {
       c = applyPlay(c, { seat: p.seat, card: p.card }, tempTrick, tricksPlayedBySeat, unseen);
       tempTrick.plays.push(p);
+      tricksPlayedBySeat[p.seat]++;
       unseen = unseenCountBySuit(c);
     }
     return c;
@@ -349,8 +354,11 @@ function PlayView({ deal, setDeal, auction, dealer, effectiveContract, effective
       contract: effectiveContract,
       leadContext: auctionLC,
       unseenBySuit: unseenCountBySuit(constraints),
+      auction,
+      dealer,
+      allTricks: deal.tricks,
     });
-  }, [constraints, deal.currentTrick, turnSeat, myRemaining, dummyRemaining, dummySeat, effectiveContract, auctionLC]);
+  }, [constraints, deal.currentTrick, turnSeat, myRemaining, dummyRemaining, dummySeat, effectiveContract, auctionLC, auction, dealer, deal.tricks]);
 
   // Possible holders for the unseen grid
   const holders = useMemo(() => possibleHolders(constraints), [constraints]);
@@ -507,6 +515,12 @@ function PlayView({ deal, setDeal, auction, dealer, effectiveContract, effective
         </div>
       )}
 
+      {/* Cards-out panel (Bug 3) — quick visibility into ranks already played per suit */}
+      <CardsOutPanel tricks={deal.tricks} currentTrick={deal.currentTrick} />
+
+      {/* Trick log (Bug 2) — most-recent trick at top, collapsible */}
+      <TrickLog tricks={deal.tricks} declarerSide={declarerSide} />
+
       {/* Inferences toggle panel */}
       <button
         onClick={() => setShowInferences(!showInferences)}
@@ -519,8 +533,90 @@ function PlayView({ deal, setDeal, auction, dealer, effectiveContract, effective
 
       <div className="text-[11px] leading-relaxed" style={{ color: 'var(--muted)' }}>
         <Info size={11} className="inline -mt-0.5 mr-1" />
-        Heuristic — engine doesn't simulate. Hint rules: forced play, cash known winner, 3rd hand high, 2nd hand low. More rules in a follow-up.
+        Heuristic — engine doesn't simulate. Hint rules: forced, cash, 3rd-high, 2nd-low, leading. More rules in a follow-up.
       </div>
+    </div>
+  );
+}
+
+/* Cards-out summary: for each suit, list ranks already played across all
+   completed and current-trick plays. Helps the user see what's still alive. */
+function CardsOutPanel({ tricks, currentTrick }) {
+  const playedBySuit = { S: [], H: [], D: [], C: [] };
+  for (const t of tricks) for (const p of t.plays) playedBySuit[p.card.suit].push(p.card.rank);
+  for (const p of currentTrick.plays) playedBySuit[p.card.suit].push(p.card.rank);
+  for (const s of SUIT_LIST) playedBySuit[s].sort((a, b) => RANK_VAL[b] - RANK_VAL[a]);
+
+  return (
+    <div className="card-tile rounded-lg p-3">
+      <div className="text-[10px] uppercase tracking-wider mb-1.5" style={{ color: 'var(--muted)' }}>Cards out</div>
+      <div className="space-y-1">
+        {SUIT_LIST.map((s) => (
+          <div key={s} className="flex items-center gap-2 text-xs">
+            <span className={`text-base w-5 text-center ${s === 'H' || s === 'D' ? 'red-suit' : 'blk-suit'}`}>{SYM[s]}</span>
+            <span className="data flex-1" style={{ color: 'var(--ink-soft)' }}>
+              {playedBySuit[s].length === 0 ? '—' : playedBySuit[s].map((r) => r === 'T' ? '10' : r).join(' ')}
+            </span>
+            <span className="text-[10px] data" style={{ color: 'var(--muted)' }}>{playedBySuit[s].length}/13</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/* Trick log: collapsible, most recent at top. Each row shows leader, the four
+   plays in order, and the winner. Compact enough that ~3 tricks fit on a phone. */
+function TrickLog({ tricks, declarerSide }) {
+  const [open, setOpen] = useState(false);
+  if (tricks.length === 0) {
+    return (
+      <div className="text-[11px]" style={{ color: 'var(--muted)' }}>
+        <Info size={11} className="inline -mt-0.5 mr-1" />
+        No completed tricks yet — they'll appear here as you play.
+      </div>
+    );
+  }
+  const reversed = [...tricks].reverse();
+  return (
+    <div className="card-tile rounded-lg overflow-hidden">
+      <button
+        onClick={() => setOpen(!open)}
+        className="w-full flex items-center justify-between p-3 text-left"
+      >
+        <div className="flex items-center gap-2">
+          <Info size={14} />
+          <span className="display text-base">Trick log</span>
+          <span className="text-xs data" style={{ color: 'var(--muted)' }}>({tricks.length} done)</span>
+        </div>
+        {open ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+      </button>
+      {open && (
+        <div className="px-3 pb-3 pt-1 space-y-1" style={{ borderTop: '1px solid var(--line-soft)' }}>
+          {reversed.map((t, i) => {
+            const trickNum = tricks.length - i;
+            const winnerSide = declarerSide.includes(t.winner) ? 'declarer' : 'defense';
+            return (
+              <div key={trickNum} className="flex items-baseline gap-2 text-xs" style={{ borderBottom: i === reversed.length - 1 ? 'none' : '1px solid var(--line-soft)', paddingBottom: 4 }}>
+                <span className="data text-[11px]" style={{ color: 'var(--muted)', minWidth: 22 }}>#{trickNum}</span>
+                <span className="text-[10px] uppercase tracking-wider" style={{ color: 'var(--muted)' }}>{t.leader} →</span>
+                <span className="data flex-1 text-[11px]">
+                  {t.plays.map((p, j) => (
+                    <span key={j} style={{ marginRight: 6 }}>
+                      <span style={{ color: PlayerColors[p.seat].bg, fontSize: 9 }}>{p.seat}</span>
+                      <span style={{ marginLeft: 1 }}>{p.card.rank === 'T' ? '10' : p.card.rank}</span>
+                      <span className={p.card.suit === 'H' || p.card.suit === 'D' ? 'red-suit' : 'blk-suit'}>{SYM[p.card.suit]}</span>
+                    </span>
+                  ))}
+                </span>
+                <span className="text-[10px] data" style={{ color: winnerSide === 'declarer' ? 'var(--felt)' : 'var(--burgundy)' }}>
+                  {t.winner}✓
+                </span>
+              </div>
+            );
+          })}
+        </div>
+      )}
     </div>
   );
 }
@@ -605,14 +701,21 @@ function UnseenGrid({ turnSeat, ledSuit, holders, constraints, onTap, playedCard
                 const played = playedCardIds.has(id);
                 const inMine = myCardIds.has(id);
                 const inDummy = dummyCardIds.has(id);
-                const possible = !played && !inMine && !inDummy
-                  && holders[id] && holders[id].has(turnSeat);
-                // Strike-through if engine thinks this seat can't have it but card is unseen
-                const impossible = !played && !inMine && !inDummy && !possible;
-                // Suit-following: must-follow → only ledSuit cards tappable
-                const mustFollowConflict = ledSuit && s !== ledSuit
-                  && SUIT_LIST.some((other) => other === ledSuit && constraints[turnSeat][ledSuit].maxLen > 0);
-                const tappable = !played && !inMine && !inDummy && !mustFollowConflict;
+                const accountedFor = played || inMine || inDummy;
+                // Engine's view: does it think turnSeat could hold this card?
+                const possible = !accountedFor && holders[id] && holders[id].has(turnSeat);
+                // "Engine disagrees" → either constraints rule out this seat
+                //   OR a led suit exists and this card is in a different suit
+                //   while engine thinks turnSeat still has the led suit.
+                // Both treatments: dim + strike-through, BUT STILL TAPPABLE
+                // (the engine is heuristic; the user might know better).
+                const impossible = !accountedFor && !possible;
+                const mustFollowConflict = !accountedFor && ledSuit && s !== ledSuit
+                  && constraints[turnSeat][ledSuit].maxLen > 0;
+                const engineDisagrees = impossible || mustFollowConflict;
+                // BUGFIX v2.3.1: tappable no longer gated on engineDisagrees —
+                // strike-through is visual only, per the v2.3 design.
+                const tappable = !accountedFor;
                 return (
                   <button
                     key={r}
@@ -621,11 +724,11 @@ function UnseenGrid({ turnSeat, ledSuit, holders, constraints, onTap, playedCard
                     className="chip-btn rounded text-xs data"
                     style={{
                       width: 22, height: 24,
-                      opacity: played || inMine || inDummy ? 0.2 : impossible ? 0.4 : 1,
-                      textDecoration: impossible ? 'line-through' : 'none',
+                      opacity: accountedFor ? 0.2 : engineDisagrees ? 0.4 : 1,
+                      textDecoration: engineDisagrees ? 'line-through' : 'none',
                       padding: 0,
                     }}
-                    title={played ? 'played' : inMine ? 'in your hand' : inDummy ? 'in dummy' : impossible ? 'engine: this seat probably does not have it' : ''}
+                    title={played ? 'played' : inMine ? 'in your hand' : inDummy ? 'in dummy' : impossible ? 'engine: this seat probably does not have it' : mustFollowConflict ? `engine: ${turnSeat} should follow ${SYM[ledSuit]}` : ''}
                   >
                     {r === 'T' ? 'X' : r}
                   </button>

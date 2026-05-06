@@ -15,6 +15,7 @@
    or null if no rule fires confidently. */
 
 import { POSITIONS, POS_INDEX, RANK_VAL, RANKS_DESC, SYM, HONORS_HCP, SUIT_LIST } from '../sharedHelpers.js';
+import { recommendOpeningLead } from './lead.js';
 
 // (uses SUIT_LIST directly throughout — no local alias to avoid name collisions when test harness concatenates modules)
 
@@ -208,8 +209,96 @@ function ruleSecondHandLow(legal, currentTrick, mySeat, leadContext) {
   };
 }
 
+/* ---- Rule 4.5 (added v2.3.1): Leading ----
+   When it's our turn AND no one has played yet this trick, we're on lead.
+   Trick 1 → use the full opening-lead engine.
+   Mid-hand → simpler heuristics:
+     - Continue the suit you led last if you won and still have it.
+     - Lead through declarer's bid suit toward dummy's weakness.
+     - Otherwise lead low from your longest unbid suit.
+   No partner-signal tracking yet — that's Phase 3 (signals layer). */
+function ruleLeading(legal, currentTrick, mySeat, ownHand, contract, leadContext, auction, dealer, allTricks) {
+  if (currentTrick.plays.length !== 0) return null;
+  if (!ownHand) return null;
+
+  // Trick 1: full opening-lead engine
+  if ((allTricks?.length || 0) === 0) {
+    const suits = { S: [], H: [], D: [], C: [] };
+    for (const c of ownHand) suits[c.suit].push(c.rank);
+    for (const s of SUIT_LIST) suits[s].sort((a, b) => RANK_VAL[b] - RANK_VAL[a]);
+    const result = recommendOpeningLead({ contract, suits, auction: auction || [], dealer: dealer || 'N' });
+    if (result?.primary && result.primary.lead) {
+      const card = { suit: result.primary.suit, rank: result.primary.lead };
+      return {
+        card,
+        rule: 'opening-lead',
+        confidence: 'medium',
+        reasoning: 'Opening lead: ' + (result.primary.reasons[0] || 'standard SAYC pick.'),
+      };
+    }
+  }
+
+  // Mid-hand lead: continue last-led suit if we won and still have it
+  const lastTrick = allTricks && allTricks.length > 0 ? allTricks[allTricks.length - 1] : null;
+  if (lastTrick && lastTrick.winner === mySeat) {
+    const ledSuit = lastTrick.plays[0].card.suit;
+    const stillHave = ownHand.filter((c) => c.suit === ledSuit);
+    // Only continue if we still have ≥2 of the suit (signal: still working)
+    if (stillHave.length >= 2) {
+      const sorted = [...stillHave].sort((a, b) => RANK_VAL[b.rank] - RANK_VAL[a.rank]);
+      // Lead low if our top is a spot card or already-played-around honor; otherwise lead the top
+      const card = sorted[sorted.length - 1];
+      return {
+        card,
+        rule: 'continue-suit',
+        confidence: 'low',
+        reasoning: `Continue ${SYM[ledSuit]} — won the last trick, still have ${stillHave.length} cards in suit. Partner can read the count.`,
+      };
+    }
+  }
+
+  // Lead through declarer's bid suit (low) toward dummy's weakness
+  if (leadContext?.declarerSuits && leadContext.declarerSuits.length > 0) {
+    for (const suit of leadContext.declarerSuits) {
+      const cardsInSuit = ownHand.filter((c) => c.suit === suit);
+      if (cardsInSuit.length === 0) continue;
+      // Skip the trump suit — leading trumps from defenders is usually wrong
+      if (contract && contract.denom !== 'NT' && suit === contract.denom) continue;
+      const sorted = [...cardsInSuit].sort((a, b) => RANK_VAL[a.rank] - RANK_VAL[b.rank]);
+      const card = sorted[0];
+      return {
+        card,
+        rule: 'through-declarer',
+        confidence: 'low',
+        reasoning: `Lead low ${SYM[suit]} through declarer — opens up the layout, partner plays last.`,
+      };
+    }
+  }
+
+  // Fallback: low from longest non-trump suit
+  const trumpDenom = contract && contract.denom !== 'NT' ? contract.denom : null;
+  let longest = null, longestLen = 0;
+  for (const suit of SUIT_LIST) {
+    if (suit === trumpDenom) continue;
+    const len = ownHand.filter((c) => c.suit === suit).length;
+    if (len > longestLen) { longest = suit; longestLen = len; }
+  }
+  if (longest) {
+    const cardsInSuit = ownHand.filter((c) => c.suit === longest)
+      .sort((a, b) => RANK_VAL[a.rank] - RANK_VAL[b.rank]);
+    return {
+      card: cardsInSuit[0],
+      rule: 'longest-suit',
+      confidence: 'low',
+      reasoning: `Low from your longest ${SYM[longest]} (${longestLen} cards) — establish length.`,
+    };
+  }
+
+  return null;
+}
+
 /* ---- Top-level recommender ---- */
-export function recommendNextCard({ constraints, currentTrick, mySeat, ownHand, contract, leadContext, unseenBySuit }) {
+export function recommendNextCard({ constraints, currentTrick, mySeat, ownHand, contract, leadContext, unseenBySuit, auction, dealer, allTricks }) {
   const ledSuit = currentTrick.plays.length > 0 ? currentTrick.plays[0].card.suit : null;
   const legal = legalCards(constraints, mySeat, ledSuit, ownHand);
   if (legal.length === 0) return null;
@@ -220,6 +309,7 @@ export function recommendNextCard({ constraints, currentTrick, mySeat, ownHand, 
     () => ruleCash(legal, currentTrick, constraints, contract, mySeat, unseenBySuit),
     () => ruleThirdHandHigh(legal, currentTrick, mySeat, leadContext),
     () => ruleSecondHandLow(legal, currentTrick, mySeat, leadContext),
+    () => ruleLeading(legal, currentTrick, mySeat, ownHand, contract, leadContext, auction, dealer, allTricks),
   ]) {
     const r = rule();
     if (r) return r;
