@@ -11,6 +11,7 @@ import {
   SuitInput, ContractPicker,
 } from './uiComponents.jsx';
 import LivePlayTab from './LivePlayTab.jsx';
+import QuickCountTab from './QuickCountTab.jsx';
 
 /* Default conventions — both on by user's selection */
 const DEFAULT_CONV = { jacobyTransfers: true, newMinorForcing: true };
@@ -1294,6 +1295,13 @@ export default function BridgeTool() {
               Card Play
             </button>
             <button
+              onClick={() => setTab('quick')}
+              className={`px-4 py-2 rounded-md text-sm transition ${tab === 'quick' ? 'active' : ''}`}
+              style={tab === 'quick' ? { background: 'var(--ink)', color: 'var(--paper)' } : { color: 'var(--ink-soft)' }}
+            >
+              Quick Count
+            </button>
+            <button
               onClick={() => setTab('live')}
               className={`px-4 py-2 rounded-md text-sm transition ${tab === 'live' ? 'active' : ''}`}
               style={tab === 'live' ? { background: 'var(--ink)', color: 'var(--paper)' } : { color: 'var(--ink-soft)' }}
@@ -1305,11 +1313,12 @@ export default function BridgeTool() {
           {tab === 'counter' && <PointsCounter />}
           {tab === 'bidder' && <BidAdvisor auction={auction} setAuction={setAuction} dealer={dealer} setDealer={setDealer} />}
           {tab === 'play' && <CardPlayTab auction={auction} setAuction={setAuction} dealer={dealer} setDealer={setDealer} />}
+          {tab === 'quick' && <QuickCountTab />}
           {tab === 'live' && <LivePlayTab auction={auction} dealer={dealer} />}
 
           <footer className="mt-12 pt-6 text-xs" style={{ borderTop: '1px solid var(--line-soft)', color: 'var(--muted)' }}>
             <div className="flex justify-between flex-wrap gap-2">
-              <span>Standard American Yellow Card · v2.4 · Mobile PWA</span>
+              <span>Standard American Yellow Card · v2.5 · Mobile PWA</span>
               <span className="display italic">play your cards close</span>
             </div>
           </footer>

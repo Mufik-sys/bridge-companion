@@ -12,6 +12,87 @@ import {
   bidValue, bidLabel, lastSuitBid, isLegalBid,
 } from './sharedHelpers.js';
 
+/* Cross/diamond trick row used by both Live Play (v2.4) and Quick Count (v2.5).
+   Renders the 4 cards of a completed trick in a diamond pattern, with the
+   winning card highlighted with a colored 2px border and a faint glow.
+   Caller supplies winnerColor (a CSS color string) and an optional
+   winnerAnnotation (revealed when the user taps the row to expand it).
+   Pure presentational — no engine knowledge of declarer/defender. */
+export function TrickRow({ trickNum, trick, winnerColor, winnerAnnotation }) {
+  const [showAnnotation, setShowAnnotation] = useState(false);
+  const playBySeat = {};
+  for (const p of trick.plays) playBySeat[p.seat] = p;
+
+  const renderSlot = (seat) => {
+    const p = playBySeat[seat];
+    const isWinner = trick.winner === seat;
+    const isLeader = trick.leader === seat;
+    if (!p) return <div style={{ width: 36, height: 26 }} />;
+    const isRed = p.card.suit === 'H' || p.card.suit === 'D';
+    return (
+      <div
+        className="rounded data text-xs flex items-center justify-center"
+        style={{
+          width: 36, height: 26, padding: '0 2px',
+          background: 'var(--paper)',
+          border: isWinner ? `2px solid ${winnerColor}` : '1px solid var(--line)',
+          color: 'var(--ink)',
+          boxShadow: isWinner ? `0 0 0 1px ${winnerColor}33` : 'none',
+        }}
+        title={`${seat}${isLeader ? ' (led)' : ''}${isWinner ? ' (won trick)' : ''}`}
+      >
+        <span>{p.card.rank === 'T' ? '10' : p.card.rank}</span>
+        <span className={isRed ? 'red-suit' : 'blk-suit'} style={{ marginLeft: 1 }}>{SYM[p.card.suit]}</span>
+      </div>
+    );
+  };
+  const seatLabel = (seat, position) => {
+    const isLeader = trick.leader === seat;
+    return (
+      <div
+        className="text-[9px] data flex items-center gap-0.5"
+        style={{ color: PlayerColors[seat].bg, justifyContent: position === 'left' ? 'flex-end' : 'flex-start' }}
+      >
+        {position === 'left' && isLeader && <span style={{ color: 'var(--burgundy)' }}>▸</span>}
+        <span>{seat}</span>
+        {position !== 'left' && isLeader && <span style={{ color: 'var(--burgundy)' }}>▸</span>}
+      </div>
+    );
+  };
+
+  return (
+    <button
+      onClick={() => setShowAnnotation(!showAnnotation)}
+      className="w-full flex items-center gap-2 text-left card-tile rounded p-2"
+      style={{ background: 'var(--paper-2)', border: '1px solid var(--line-soft)' }}
+    >
+      <div className="data display text-[11px]" style={{ color: 'var(--muted)', minWidth: 24, textAlign: 'right' }}>
+        #{trickNum}
+      </div>
+      <div className="flex flex-col items-center gap-0.5" style={{ minWidth: 124 }}>
+        <div className="flex items-center gap-1">
+          {seatLabel('N', 'left')}
+          {renderSlot('N')}
+        </div>
+        <div className="flex items-center gap-1">
+          {seatLabel('W', 'left')}
+          {renderSlot('W')}
+          {renderSlot('E')}
+          {seatLabel('E', 'right')}
+        </div>
+        <div className="flex items-center gap-1">
+          {renderSlot('S')}
+          {seatLabel('S', 'right')}
+        </div>
+      </div>
+      <div className="flex-1 text-[10px] data" style={{ color: winnerColor, textAlign: 'right' }}>
+        <div>{trick.winner} won</div>
+        {showAnnotation && winnerAnnotation && <div style={{ color: 'var(--muted)' }}>{winnerAnnotation}</div>}
+      </div>
+    </button>
+  );
+}
+
 /* Suit-coloured tile used by the points counter to mark which honor went where. */
 export function HonorTile({ rank, suit, owner, onClick }) {
   const isRed = suit === '♥' || suit === '♦';
