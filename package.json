@@ -1,7 +1,7 @@
 {
   "name": "bridge-companion",
   "private": true,
-  "version": "2.5.0",
+  "version": "2.5.1",
   "type": "module",
   "description": "SAYC bridge companion — HCP counter, auction advisor, card-play helper. Mobile-first PWA.",
   "scripts": {

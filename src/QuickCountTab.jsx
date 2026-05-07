@@ -13,7 +13,7 @@
    Persisted under bridge-quickcount-v1 — separate from the Live Play
    localStorage key so the two tabs don't collide. */
 
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef } from 'react'; // useRef used by CardCell for long-press timer
 import { RotateCcw, Undo2 } from 'lucide-react';
 import {
   POSITIONS, SYM, SUIT_LIST, RANKS_DESC, RANK_VAL, HONORS_HCP, PlayerColors,
@@ -95,23 +95,31 @@ export default function QuickCountTab() {
   }));
   const ledSuit = currentTrickPlays.length > 0 ? currentTrickPlays[0].card.suit : null;
 
-  // ---- Tap flow ----
-  const handleCardTap = (cardObj) => {
-    if (deal.played[cardId(cardObj.suit, cardObj.rank)]) return; // already played
-    setPickerCard(cardObj);
+  // Seats already assigned in the current (in-progress) trick.
+  // Used to (a) auto-rotate after the leader, (b) disable in the picker.
+  const seatsInCurrentTrick = currentTrickPlays.map((p) => p.seat);
+
+  // Compute the next seat in clockwise order from the leader.
+  // POSITIONS = ['N','E','S','W']; clockwise.
+  const nextSeatClockwise = () => {
+    if (seatsInCurrentTrick.length === 0) return null; // no leader yet
+    const leader = seatsInCurrentTrick[0];
+    const leaderIdx = POSITIONS.indexOf(leader);
+    const nextIdx = (leaderIdx + seatsInCurrentTrick.length) % 4;
+    return POSITIONS[nextIdx];
   };
 
-  const assignSeat = (seat) => {
-    if (!pickerCard) return;
-    const id = cardId(pickerCard.suit, pickerCard.rank);
-    if (deal.played[id]) { setPickerCard(null); return; }
+  // Core assignment — does the trick math and writes state.
+  // Used both by the auto-rotation path (no picker) and the picker path.
+  const recordPlay = (cardObj, seat) => {
+    const id = cardId(cardObj.suit, cardObj.rank);
+    if (deal.played[id]) return;
 
     const newPlayed = { ...deal.played, [id]: seat };
     const newTrickOrder = [...deal.trickOrder, id];
     let newTricks = deal.tricks;
     let newCurrentStart = deal.currentTrickStart;
 
-    // Detect trick completion (4 cards in current trick)
     const inProgressLen = newTrickOrder.length - deal.currentTrickStart;
     if (inProgressLen === 4) {
       const plays = newTrickOrder.slice(deal.currentTrickStart).map((tid) => ({
@@ -131,6 +139,30 @@ export default function QuickCountTab() {
       tricks: newTricks,
       currentTrickStart: newCurrentStart,
     });
+  };
+
+  // ---- Tap flow (Bug 1 fix: auto-rotate after the lead) ----
+  const handleCardTap = (cardObj) => {
+    if (deal.played[cardId(cardObj.suit, cardObj.rank)]) return;
+    if (seatsInCurrentTrick.length === 0) {
+      // First card of a new trick — picker required to set the leader
+      setPickerCard({ card: cardObj, override: false });
+      return;
+    }
+    // Mid-trick: auto-assign to the next seat clockwise from the leader
+    const seat = nextSeatClockwise();
+    if (seat) recordPlay(cardObj, seat);
+  };
+
+  // Long-press path: force the picker even mid-trick (override case)
+  const handleCardLongPress = (cardObj) => {
+    if (deal.played[cardId(cardObj.suit, cardObj.rank)]) return;
+    setPickerCard({ card: cardObj, override: true });
+  };
+
+  const assignSeat = (seat) => {
+    if (!pickerCard) return;
+    recordPlay(pickerCard.card, seat);
     setPickerCard(null);
   };
 
@@ -199,9 +231,17 @@ export default function QuickCountTab() {
       <div className="card-tile rounded-lg p-3">
         <div className="text-[10px] uppercase tracking-wider mb-2" style={{ color: 'var(--muted)' }}>
           Tap a card to record who played it
+          {seatsInCurrentTrick.length > 0 && (
+            <span style={{ marginLeft: 6, color: 'var(--felt)' }}>
+              · auto-rotating from {seatsInCurrentTrick[0]} → next is {nextSeatClockwise()}
+            </span>
+          )}
         </div>
         <div style={{ overflowX: 'auto', WebkitOverflowScrolling: 'touch' }}>
-          <CardGrid played={deal.played} onTap={handleCardTap} />
+          <CardGrid played={deal.played} onTap={handleCardTap} onLongPress={handleCardLongPress} />
+        </div>
+        <div className="text-[10px] mt-2" style={{ color: 'var(--muted)' }}>
+          Long-press a card to override the seat (or to assign mid-trick out of clockwise order).
         </div>
       </div>
 
@@ -257,7 +297,9 @@ export default function QuickCountTab() {
       {/* Player picker modal */}
       {pickerCard && (
         <PlayerPicker
-          card={pickerCard}
+          card={pickerCard.card}
+          override={pickerCard.override}
+          disabledSeats={seatsInCurrentTrick}
           onPick={assignSeat}
           onCancel={() => setPickerCard(null)}
         />
@@ -344,8 +386,10 @@ function CurrentTrickStrip({ plays }) {
 
 /* ---- Card grid: 4 rows × 13 columns of tap targets ----
    Each cell ≥44px square. On narrow phones the grid overflows
-   horizontally and the parent allows touch-scroll. */
-function CardGrid({ played, onTap }) {
+   horizontally and the parent allows touch-scroll.
+   v2.5.1: long-press a cell (≥500ms) → onLongPress(card) for the
+   override path (force seat picker mid-trick). */
+function CardGrid({ played, onTap, onLongPress }) {
   return (
     <div className="space-y-1.5" style={{ minWidth: 'min-content' }}>
       {SUIT_LIST.map((suit) => (
@@ -357,35 +401,16 @@ function CardGrid({ played, onTap }) {
             {SYM[suit]}
           </div>
           <div className="flex gap-1">
-            {RANKS_DESC.map((rank) => {
-              const id = cardId(suit, rank);
-              const isPlayed = !!played[id];
-              const seat = played[id];
-              const isRed = suit === 'H' || suit === 'D';
-              return (
-                <button
-                  key={rank}
-                  onClick={() => !isPlayed && onTap({ suit, rank })}
-                  disabled={isPlayed}
-                  className="card-tile rounded data flex flex-col items-center justify-center"
-                  style={{
-                    width: 44, height: 44, padding: 0,
-                    opacity: isPlayed ? 0.25 : 1,
-                    border: isPlayed ? 'none' : '1px solid var(--line)',
-                    background: isPlayed ? 'transparent' : 'var(--paper)',
-                    flexShrink: 0,
-                  }}
-                  title={isPlayed ? `played by ${seat}` : `${rank}${SYM[suit]}`}
-                >
-                  <span style={{ fontSize: 14, fontWeight: 600 }}>{rank === 'T' ? '10' : rank}</span>
-                  {isPlayed && (
-                    <span className="text-[9px] data" style={{ color: PlayerColors[seat]?.bg, lineHeight: 1 }}>
-                      {seat}
-                    </span>
-                  )}
-                </button>
-              );
-            })}
+            {RANKS_DESC.map((rank) => (
+              <CardCell
+                key={rank}
+                suit={suit}
+                rank={rank}
+                played={played}
+                onTap={onTap}
+                onLongPress={onLongPress}
+              />
+            ))}
           </div>
         </div>
       ))}
@@ -393,9 +418,68 @@ function CardGrid({ played, onTap }) {
   );
 }
 
-/* ---- Player picker (centered modal) ---- */
-function PlayerPicker({ card, onPick, onCancel }) {
+/* Single card cell with combined tap + long-press handling.
+   Long-press fires onLongPress and SUPPRESSES the trailing click. */
+function CardCell({ suit, rank, played, onTap, onLongPress }) {
+  const id = cardId(suit, rank);
+  const isPlayed = !!played[id];
+  const seat = played[id];
+  const timerRef = useRef(null);
+  const longPressedRef = useRef(false);
+
+  const start = () => {
+    if (isPlayed) return;
+    longPressedRef.current = false;
+    timerRef.current = setTimeout(() => {
+      longPressedRef.current = true;
+      onLongPress?.({ suit, rank });
+    }, 500);
+  };
+  const cancel = () => {
+    if (timerRef.current) { clearTimeout(timerRef.current); timerRef.current = null; }
+  };
+  const handleClick = () => {
+    if (longPressedRef.current) { longPressedRef.current = false; return; }
+    if (!isPlayed) onTap({ suit, rank });
+  };
+
+  return (
+    <button
+      onClick={handleClick}
+      onPointerDown={start}
+      onPointerUp={cancel}
+      onPointerLeave={cancel}
+      onPointerCancel={cancel}
+      onContextMenu={(e) => e.preventDefault()}
+      disabled={isPlayed}
+      className="card-tile rounded data flex flex-col items-center justify-center"
+      style={{
+        width: 44, height: 44, padding: 0,
+        opacity: isPlayed ? 0.25 : 1,
+        border: isPlayed ? 'none' : '1px solid var(--line)',
+        background: isPlayed ? 'transparent' : 'var(--paper)',
+        flexShrink: 0,
+        userSelect: 'none', WebkitUserSelect: 'none',
+      }}
+      title={isPlayed ? `played by ${seat}` : `${rank}${SYM[suit]} — tap to record, long-press to override seat`}
+    >
+      <span style={{ fontSize: 14, fontWeight: 600 }}>{rank === 'T' ? '10' : rank}</span>
+      {isPlayed && (
+        <span className="text-[9px] data" style={{ color: PlayerColors[seat]?.bg, lineHeight: 1 }}>
+          {seat}
+        </span>
+      )}
+    </button>
+  );
+}
+
+/* ---- Player picker (centered modal) ----
+   v2.5.1: disabledSeats are seats already represented in the in-progress
+   trick. They render at 0.3 opacity, are not tappable, and the modal
+   subtitle explains why. Prevents double-assignment in the override path. */
+function PlayerPicker({ card, override, disabledSeats = [], onPick, onCancel }) {
   const isRed = card.suit === 'H' || card.suit === 'D';
+  const dis = new Set(disabledSeats);
   return (
     <div
       onClick={onCancel}
@@ -413,7 +497,7 @@ function PlayerPicker({ card, onPick, onCancel }) {
       >
         <div className="text-center mb-3">
           <div className="text-[10px] uppercase tracking-wider mb-1" style={{ color: 'var(--muted)' }}>
-            Who played this card?
+            {override ? 'Override seat for this card' : 'Who played this card?'}
           </div>
           <div className="display text-4xl">
             <span className="data">{card.rank === 'T' ? '10' : card.rank}</span>
@@ -421,21 +505,34 @@ function PlayerPicker({ card, onPick, onCancel }) {
           </div>
         </div>
         <div className="grid grid-cols-2 gap-2">
-          {POSITIONS.map((seat) => (
-            <button
-              key={seat}
-              onClick={() => onPick(seat)}
-              className="rounded-lg display"
-              style={{
-                background: PlayerColors[seat].bg,
-                color: PlayerColors[seat].fg,
-                minHeight: 64, fontSize: 22, fontWeight: 700,
-              }}
-            >
-              {seat}
-            </button>
-          ))}
+          {POSITIONS.map((seat) => {
+            const disabled = dis.has(seat);
+            return (
+              <button
+                key={seat}
+                onClick={() => !disabled && onPick(seat)}
+                disabled={disabled}
+                className="rounded-lg display"
+                style={{
+                  background: PlayerColors[seat].bg,
+                  color: PlayerColors[seat].fg,
+                  minHeight: 64, fontSize: 22, fontWeight: 700,
+                  opacity: disabled ? 0.3 : 1,
+                }}
+                title={disabled ? `${seat} already played in this trick` : seat}
+              >
+                {seat}
+              </button>
+            );
+          })}
         </div>
+        {disabledSeats.length > 0 && (
+          <div className="text-[10px] mt-2 text-center" style={{ color: 'var(--muted)' }}>
+            {disabledSeats.length === 1 ? 'Seat ' : 'Seats '}
+            <span className="data">{disabledSeats.join(', ')}</span>
+            {disabledSeats.length === 1 ? ' has' : ' have'} already played in this trick.
+          </div>
+        )}
         <button
           onClick={onCancel}
           className="w-full mt-3 pill-btn rounded-md py-2 text-xs"
