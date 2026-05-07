@@ -1309,7 +1309,7 @@ export default function BridgeTool() {
 
           <footer className="mt-12 pt-6 text-xs" style={{ borderTop: '1px solid var(--line-soft)', color: 'var(--muted)' }}>
             <div className="flex justify-between flex-wrap gap-2">
-              <span>Standard American Yellow Card · v2.3.1 · Mobile PWA</span>
+              <span>Standard American Yellow Card · v2.3.2 · Mobile PWA</span>
               <span className="display italic">play your cards close</span>
             </div>
           </footer>

@@ -110,6 +110,8 @@ export default function LivePlayTab({ auction, dealer }) {
         auctionLC={auctionLC}
         effectiveContract={effectiveContract}
         effectiveDeclarer={effectiveDeclarer}
+        dummySeat={dummySeat}
+        openingLeader={openingLeader}
         myCards={myCards}
         myHCP={myHCP}
       />
@@ -141,9 +143,14 @@ export default function LivePlayTab({ auction, dealer }) {
 /* =========================================================
    SETUP VIEW
    ========================================================= */
-function SetupView({ deal, setDeal, useAuctionContext, auctionContract, auctionLC, effectiveContract, effectiveDeclarer, myCards, myHCP }) {
+function SetupView({ deal, setDeal, useAuctionContext, auctionContract, auctionLC, effectiveContract, effectiveDeclarer, dummySeat, openingLeader, myCards, myHCP }) {
   const [showManual, setShowManual] = useState(!useAuctionContext);
   const totalCards = myCards.length;
+  // BUGFIX v2.3.2: in manual setup, require an explicit declarer choice — no
+  // silent default. The previous default of 'N' caused a user-engine mismatch
+  // when the user assumed a different declarer.
+  const declarerExplicit = useAuctionContext || !!deal.manualDeclarer;
+  const setupReady = totalCards === 13 && !!effectiveContract && declarerExplicit;
 
   const startPlay = () => {
     const leader = useAuctionContext
@@ -171,7 +178,7 @@ function SetupView({ deal, setDeal, useAuctionContext, auctionContract, auctionL
       <div className="card-tile rounded-lg p-4">
         <div className="flex items-center justify-between mb-3">
           <h3 className="display text-xl">Contract</h3>
-          {effectiveContract && (
+          {effectiveContract && declarerExplicit && (
             <div className="text-sm data" style={{ color: 'var(--muted)' }}>
               <span style={{ color: 'var(--ink)' }}>{effectiveContract.level}</span>
               <span className={effectiveContract.denom === 'H' || effectiveContract.denom === 'D' ? 'red-suit' : 'blk-suit'} style={{ marginLeft: 2 }}>
@@ -206,17 +213,29 @@ function SetupView({ deal, setDeal, useAuctionContext, auctionContract, auctionL
               setContract={(c) => setDeal({ ...deal, manualContract: c })}
             />
             <div>
-              <div className="text-[10px] uppercase tracking-wider mb-1.5" style={{ color: 'var(--muted)' }}>Declarer</div>
+              <div className="text-[10px] uppercase tracking-wider mb-1.5" style={{ color: 'var(--muted)' }}>
+                Declarer {!deal.manualDeclarer && <span style={{ color: 'var(--burgundy)' }}>· required</span>}
+              </div>
               <div className="flex gap-1">
                 {POSITIONS.map((p) => (
                   <button
                     key={p}
                     onClick={() => setDeal({ ...deal, manualDeclarer: p })}
-                    className={`pill-btn rounded-md flex-1 py-2 display text-base ${(deal.manualDeclarer || 'N') === p ? 'active' : ''}`}
+                    className={`pill-btn rounded-md flex-1 py-2 display text-base ${deal.manualDeclarer === p ? 'active' : ''}`}
                   >{p}</button>
                 ))}
               </div>
             </div>
+          </div>
+        )}
+        {/* BUGFIX v2.3.2: prominent seat-role banner so the user can verify
+            who's declarer/dummy/leader before entering hands. The previous
+            UI never told the user which seat was dummy. */}
+        {declarerExplicit && (
+          <div className="mt-3 pt-3 flex items-center gap-2 flex-wrap" style={{ borderTop: '1px solid var(--line-soft)' }}>
+            <SeatChip seat={effectiveDeclarer} role="Declarer" tone="felt" />
+            <SeatChip seat={dummySeat} role="Dummy" tone="burgundy" />
+            <SeatChip seat={openingLeader} role="Opens lead" tone="ink" />
           </div>
         )}
       </div>
@@ -240,7 +259,11 @@ function SetupView({ deal, setDeal, useAuctionContext, auctionContract, auctionL
 
       <div className="card-tile rounded-lg p-4">
         <div className="flex items-center justify-between mb-3">
-          <h3 className="display text-xl">Dummy's hand (optional)</h3>
+          <h3 className="display text-xl flex items-center gap-2">
+            Dummy's hand
+            {declarerExplicit && <SeatChip seat={dummySeat} role="" tone="burgundy" inline />}
+            <span className="text-xs" style={{ color: 'var(--muted)', fontWeight: 'normal' }}>(optional)</span>
+          </h3>
           {deal.dummyEntered && (
             <button onClick={() => setDeal({ ...deal, dummyEntered: false, dummyHandRaw: { S:'', H:'', D:'', C:'' } })} className="text-xs" style={{ color: 'var(--muted)' }}>
               Skip dummy
@@ -268,12 +291,19 @@ function SetupView({ deal, setDeal, useAuctionContext, auctionContract, auctionL
 
       <button
         onClick={startPlay}
-        disabled={totalCards !== 13 || !effectiveContract}
+        disabled={!setupReady}
         className="w-full chip-btn rounded-lg py-3 display text-lg"
-        style={{ background: totalCards === 13 && effectiveContract ? 'var(--felt)' : 'var(--paper-2)', color: totalCards === 13 && effectiveContract ? 'var(--paper)' : 'var(--muted)' }}
+        style={{ background: setupReady ? 'var(--felt)' : 'var(--paper-2)', color: setupReady ? 'var(--paper)' : 'var(--muted)' }}
       >
         Start playing →
       </button>
+      {!setupReady && (
+        <div className="text-[11px] text-center" style={{ color: 'var(--muted)' }}>
+          {totalCards !== 13 && <div>Need 13 cards in your hand.</div>}
+          {!effectiveContract && <div>Need a contract.</div>}
+          {!declarerExplicit && <div>Pick declarer above.</div>}
+        </div>
+      )}
     </div>
   );
 }
@@ -364,7 +394,22 @@ function PlayView({ deal, setDeal, auction, dealer, effectiveContract, effective
   const holders = useMemo(() => possibleHolders(constraints), [constraints]);
 
   /* ---- Tap a card → record it for the current turn ---- */
-  const playCard = (cardObj) => {
+  const playCard = (cardObj, source = 'unknown') => {
+    // DIAGNOSTIC v2.3.2: log every play attempt — helps find the disconnect when
+    // a tap in the unseen grid doesn't fire because the engine's dummySeat
+    // disagrees with the user's mental dummy seat.
+    console.log('[LivePlay tap]', {
+      surface: source,
+      card: cardObj.rank + cardObj.suit,
+      turnSeat,
+      currentTrickLeader: deal.currentTrick.leader,
+      effectiveDeclarer,
+      dummySeat,
+      dummyEntered: !!dummyCards,
+      knownSeats: ['S', dummyCards ? dummySeat : null].filter(Boolean),
+      ledSuit,
+      trickNumber: deal.trickNumber,
+    });
     const newTrick = { ...deal.currentTrick, plays: [...deal.currentTrick.plays, { seat: turnSeat, card: cardObj }] };
 
     if (newTrick.plays.length < 4) {
@@ -487,16 +532,16 @@ function PlayView({ deal, setDeal, auction, dealer, effectiveContract, effective
 
       {/* Tap zone — own hand if turn is mine/dummy, else unseen grid */}
       {turnSeat === 'S' ? (
-        <HandTapZone label="Your hand" cards={myRemaining} ledSuit={ledSuit} onTap={playCard} />
+        <HandTapZone label="Your hand" cards={myRemaining} ledSuit={ledSuit} onTap={(c) => playCard(c, 'my-hand-strip')} />
       ) : turnSeat === dummySeat && dummyRemaining ? (
-        <HandTapZone label={`Dummy (${dummySeat})`} cards={dummyRemaining} ledSuit={ledSuit} onTap={playCard} />
+        <HandTapZone label={`Dummy (${dummySeat})`} cards={dummyRemaining} ledSuit={ledSuit} onTap={(c) => playCard(c, 'dummy-hand-strip')} />
       ) : (
         <UnseenGrid
           turnSeat={turnSeat}
           ledSuit={ledSuit}
           holders={holders}
           constraints={constraints}
-          onTap={playCard}
+          onTap={(c) => playCard(c, 'unseen-grid')}
           playedCardIds={playedCardIds}
           myCardIds={new Set(myCards.map((c) => c.rank + c.suit))}
           dummyCardIds={dummyCards ? new Set(dummyCards.map((c) => c.rank + c.suit)) : new Set()}
@@ -536,6 +581,27 @@ function PlayView({ deal, setDeal, auction, dealer, effectiveContract, effective
         Heuristic — engine doesn't simulate. Hint rules: forced, cash, 3rd-high, 2nd-low, leading. More rules in a follow-up.
       </div>
     </div>
+  );
+}
+
+/* Seat chip: small colored pill showing a seat's role (Declarer / Dummy /
+   Opens lead). Visually prominent so users can verify the seating before
+   entering hands — root-cause fix for the v2.3.1 "card not tappable" bug
+   where the user had a different mental model of dummy than the engine. */
+function SeatChip({ seat, role, tone, inline }) {
+  const palette = {
+    felt: { bg: 'var(--felt)', fg: 'var(--paper)' },
+    burgundy: { bg: 'var(--burgundy)', fg: 'var(--paper)' },
+    ink: { bg: 'var(--ink)', fg: 'var(--paper)' },
+  }[tone] || { bg: 'var(--ink)', fg: 'var(--paper)' };
+  return (
+    <span
+      className={`inline-flex items-center gap-1.5 rounded-full ${inline ? 'px-2 py-0.5' : 'px-2.5 py-1'}`}
+      style={{ background: palette.bg, color: palette.fg, fontSize: inline ? 11 : 12 }}
+    >
+      {role && <span style={{ opacity: 0.85 }}>{role}</span>}
+      <span className="display" style={{ fontWeight: 600 }}>{seat}</span>
+    </span>
   );
 }
 
@@ -716,19 +782,32 @@ function UnseenGrid({ turnSeat, ledSuit, holders, constraints, onTap, playedCard
                 // BUGFIX v2.3.1: tappable no longer gated on engineDisagrees —
                 // strike-through is visual only, per the v2.3 design.
                 const tappable = !accountedFor;
+                // BUGFIX v2.3.2: three distinct visual tiers so the user can
+                // tell at a glance why a card is dim. Previous treatment had
+                // accountedFor at 0.2 with no marker — too easy to confuse
+                // with a tappable card.
+                //   accountedFor (in mine/dummy/played): opacity 0.15, no marker
+                //   engineDisagrees (impossible / must-follow): opacity 0.55,
+                //                                             burgundy strike-through, tappable
+                //   normal: opacity 1, tappable
+                const cellStyle = {
+                  width: 22, height: 24,
+                  padding: 0,
+                  opacity: accountedFor ? 0.15 : engineDisagrees ? 0.55 : 1,
+                  textDecorationLine: engineDisagrees ? 'line-through' : 'none',
+                  textDecorationColor: engineDisagrees ? 'var(--burgundy)' : undefined,
+                  textDecorationThickness: engineDisagrees ? 2 : undefined,
+                  background: engineDisagrees ? 'rgba(122, 31, 42, 0.08)' : undefined,
+                  color: engineDisagrees ? 'var(--burgundy)' : undefined,
+                };
                 return (
                   <button
                     key={r}
                     onClick={() => tappable && onTap({ rank: r, suit: s })}
                     disabled={!tappable}
                     className="chip-btn rounded text-xs data"
-                    style={{
-                      width: 22, height: 24,
-                      opacity: accountedFor ? 0.2 : engineDisagrees ? 0.4 : 1,
-                      textDecoration: engineDisagrees ? 'line-through' : 'none',
-                      padding: 0,
-                    }}
-                    title={played ? 'played' : inMine ? 'in your hand' : inDummy ? 'in dummy' : impossible ? 'engine: this seat probably does not have it' : mustFollowConflict ? `engine: ${turnSeat} should follow ${SYM[ledSuit]}` : ''}
+                    style={cellStyle}
+                    title={played ? 'played' : inMine ? 'in your hand' : inDummy ? `in ${turnSeat === 'S' ? 'dummy' : 'a known hand'} — tap from that hand strip` : impossible ? `engine: ${turnSeat} probably does not have this — tap to override` : mustFollowConflict ? `engine: ${turnSeat} should follow ${SYM[ledSuit]} — tap to override` : ''}
                   >
                     {r === 'T' ? 'X' : r}
                   </button>
