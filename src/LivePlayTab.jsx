@@ -21,11 +21,13 @@ import {
   PlayerColors, parseHolding, deriveContract, deriveLeadContext, handHCP,
 } from './sharedHelpers.js';
 import { ContractPicker, SuitInput } from './uiComponents.jsx';
-import { buildConstraints, applyPlay, summarize, possibleHolders, unseenCountBySuit, trickWinner } from './engines/inference.js';
+import { buildConstraints, applyPlay, possibleHolders, unseenCountBySuit, trickWinner } from './engines/inference.js';
 import { recommendNextCard } from './engines/play.js';
 
 const STORAGE_KEY = 'bridge-companion-deal-v1';
-const SCHEMA_VERSION = 1;
+// Bumped to 2 in v2.4 — added uiPrefs. Older state with schemaVersion 1
+// will be discarded on load (one-time wipe; user re-enters their hand).
+const SCHEMA_VERSION = 2;
 
 const initialDealState = () => ({
   schemaVersion: SCHEMA_VERSION,
@@ -38,6 +40,14 @@ const initialDealState = () => ({
   tricks: [],
   currentTrick: { leader: null, plays: [] },
   trickNumber: 1,
+  // v2.4: persisted UI toggle state. Defaults match the spec —
+  // HCP played hidden (extra info on demand), inferences expanded
+  // (their data informs the play; user wants to see it), hint visible.
+  uiPrefs: {
+    showHcpPlayed: false,
+    showInferences: true,
+    showHint: true,
+  },
 });
 
 /* Convert raw text holdings to a list of {suit, rank} cards. */
@@ -312,8 +322,13 @@ function SetupView({ deal, setDeal, useAuctionContext, auctionContract, auctionL
    PLAY VIEW
    ========================================================= */
 function PlayView({ deal, setDeal, auction, dealer, effectiveContract, effectiveDeclarer, dummySeat, openingLeader, myCards, dummyCards, auctionLC, resetAll }) {
-  const [showInferences, setShowInferences] = useState(false);
-  const [showHint, setShowHint] = useState(true);
+  // v2.4: toggle state lifted from local useState into deal.uiPrefs so it
+  // persists across reloads via useDealStorage.
+  const uiPrefs = deal.uiPrefs || { showHcpPlayed: false, showInferences: true, showHint: true };
+  const setPref = (key, value) => setDeal({ ...deal, uiPrefs: { ...uiPrefs, [key]: value } });
+  const showInferences = uiPrefs.showInferences;
+  const showHint = uiPrefs.showHint;
+  const showHcpPlayed = uiPrefs.showHcpPlayed;
 
   const trumpDenom = effectiveContract.denom === 'NT' ? null : effectiveContract.denom;
 
@@ -503,6 +518,17 @@ function PlayView({ deal, setDeal, auction, dealer, effectiveContract, effective
         </div>
       </div>
 
+      {/* v2.4: HCP played per seat — toggle (chip-style) + row */}
+      <div className="flex items-center gap-2 flex-wrap">
+        <button
+          onClick={() => setPref('showHcpPlayed', !showHcpPlayed)}
+          className={`pill-btn rounded-full px-3 py-1 text-[11px] flex items-center gap-1 ${showHcpPlayed ? 'active' : ''}`}
+        >
+          HCP played {showHcpPlayed ? '·' : '+'}
+        </button>
+        {showHcpPlayed && <HcpPlayedRow constraints={constraints} />}
+      </div>
+
       {/* Hint panel */}
       {showHint && hint && (
         <div className="recommendation rounded-lg p-3">
@@ -510,7 +536,7 @@ function PlayView({ deal, setDeal, auction, dealer, effectiveContract, effective
             <div className="text-[10px] uppercase tracking-wider" style={{ color: 'var(--burgundy)' }}>
               Suggested for {turnSeat}
             </div>
-            <button onClick={() => setShowHint(false)} className="text-[10px]" style={{ color: 'var(--muted)' }}>hide</button>
+            <button onClick={() => setPref('showHint', false)} className="text-[10px]" style={{ color: 'var(--muted)' }}>hide</button>
           </div>
           {hint.card ? (
             <div className="display text-2xl">
@@ -525,7 +551,7 @@ function PlayView({ deal, setDeal, auction, dealer, effectiveContract, effective
         </div>
       )}
       {!showHint && (
-        <button onClick={() => setShowHint(true)} className="pill-btn rounded-md px-3 py-1.5 text-xs flex items-center gap-1">
+        <button onClick={() => setPref('showHint', true)} className="pill-btn rounded-md px-3 py-1.5 text-xs flex items-center gap-1">
           <Eye size={12} /> Show hint
         </button>
       )}
@@ -566,15 +592,13 @@ function PlayView({ deal, setDeal, auction, dealer, effectiveContract, effective
       {/* Trick log (Bug 2) — most-recent trick at top, collapsible */}
       <TrickLog tricks={deal.tricks} declarerSide={declarerSide} />
 
-      {/* Inferences toggle panel */}
-      <button
-        onClick={() => setShowInferences(!showInferences)}
-        className="pill-btn rounded-md w-full py-2 text-xs flex items-center justify-center gap-1.5"
-      >
-        {showInferences ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
-        {showInferences ? 'Hide' : 'Show'} inferences
-      </button>
-      {showInferences && <InferencesPanel constraints={constraints} />}
+      {/* v2.4: Inferred distribution panel — collapsible, expanded by default */}
+      <InferredDistribution
+        constraints={constraints}
+        dummySeat={dummyCards ? dummySeat : null}
+        open={showInferences}
+        setOpen={(v) => setPref('showInferences', v)}
+      />
 
       <div className="text-[11px] leading-relaxed" style={{ color: 'var(--muted)' }}>
         <Info size={11} className="inline -mt-0.5 mr-1" />
@@ -631,8 +655,15 @@ function CardsOutPanel({ tricks, currentTrick }) {
   );
 }
 
-/* Trick log: collapsible, most recent at top. Each row shows leader, the four
-   plays in order, and the winner. Compact enough that ~3 tricks fit on a phone. */
+/* v2.4: Trick log redesigned as cross/diamond layout (matches Funbridge's
+   "List of tricks" view).
+       N
+     W   E
+       S
+   Plus trick number on the left, winning card highlighted with a colored
+   border (felt = declarer side, burgundy = defenders), and a small ▸
+   marker next to the leader's seat. Most recent trick at top.
+   Pure flexbox — no SVG, no library. ~3 rows per phone screen. */
 function TrickLog({ tricks, declarerSide }) {
   const [open, setOpen] = useState(false);
   if (tricks.length === 0) {
@@ -658,32 +689,103 @@ function TrickLog({ tricks, declarerSide }) {
         {open ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
       </button>
       {open && (
-        <div className="px-3 pb-3 pt-1 space-y-1" style={{ borderTop: '1px solid var(--line-soft)' }}>
-          {reversed.map((t, i) => {
-            const trickNum = tricks.length - i;
-            const winnerSide = declarerSide.includes(t.winner) ? 'declarer' : 'defense';
-            return (
-              <div key={trickNum} className="flex items-baseline gap-2 text-xs" style={{ borderBottom: i === reversed.length - 1 ? 'none' : '1px solid var(--line-soft)', paddingBottom: 4 }}>
-                <span className="data text-[11px]" style={{ color: 'var(--muted)', minWidth: 22 }}>#{trickNum}</span>
-                <span className="text-[10px] uppercase tracking-wider" style={{ color: 'var(--muted)' }}>{t.leader} →</span>
-                <span className="data flex-1 text-[11px]">
-                  {t.plays.map((p, j) => (
-                    <span key={j} style={{ marginRight: 6 }}>
-                      <span style={{ color: PlayerColors[p.seat].bg, fontSize: 9 }}>{p.seat}</span>
-                      <span style={{ marginLeft: 1 }}>{p.card.rank === 'T' ? '10' : p.card.rank}</span>
-                      <span className={p.card.suit === 'H' || p.card.suit === 'D' ? 'red-suit' : 'blk-suit'}>{SYM[p.card.suit]}</span>
-                    </span>
-                  ))}
-                </span>
-                <span className="text-[10px] data" style={{ color: winnerSide === 'declarer' ? 'var(--felt)' : 'var(--burgundy)' }}>
-                  {t.winner}✓
-                </span>
-              </div>
-            );
-          })}
+        <div className="px-3 pb-3 pt-2 space-y-2" style={{ borderTop: '1px solid var(--line-soft)' }}>
+          {reversed.map((t, i) => (
+            <TrickRow
+              key={tricks.length - i}
+              trickNum={tricks.length - i}
+              trick={t}
+              declarerSide={declarerSide}
+            />
+          ))}
         </div>
       )}
     </div>
+  );
+}
+
+/* Single cross-layout trick row.
+     [#3]    ·  N      ▸N
+              W   E       ·-bordered = winner
+                  S
+     [winner: N] */
+function TrickRow({ trickNum, trick, declarerSide }) {
+  const [showAnnotation, setShowAnnotation] = useState(false);
+  const winnerSide = declarerSide.includes(trick.winner) ? 'declarer' : 'defense';
+  const winnerColor = winnerSide === 'declarer' ? 'var(--felt)' : 'var(--burgundy)';
+  // Map plays to seat for fast lookup
+  const playBySeat = {};
+  for (const p of trick.plays) playBySeat[p.seat] = p;
+  const renderSlot = (seat) => {
+    const p = playBySeat[seat];
+    const isWinner = trick.winner === seat;
+    const isLeader = trick.leader === seat;
+    if (!p) return <div style={{ width: 36, height: 26 }} />;
+    const isRed = p.card.suit === 'H' || p.card.suit === 'D';
+    return (
+      <div
+        className="rounded data text-xs flex items-center justify-center"
+        style={{
+          width: 36, height: 26, padding: '0 2px',
+          background: 'var(--paper)',
+          border: isWinner ? `2px solid ${winnerColor}` : '1px solid var(--line)',
+          color: 'var(--ink)',
+          boxShadow: isWinner ? `0 0 0 1px ${winnerColor}33` : 'none',
+        }}
+        title={`${seat}${isLeader ? ' (led)' : ''}${isWinner ? ' (won trick)' : ''}`}
+      >
+        <span>{p.card.rank === 'T' ? '10' : p.card.rank}</span>
+        <span className={isRed ? 'red-suit' : 'blk-suit'} style={{ marginLeft: 1 }}>{SYM[p.card.suit]}</span>
+      </div>
+    );
+  };
+  const seatLabel = (seat, position) => {
+    const isLeader = trick.leader === seat;
+    return (
+      <div
+        className="text-[9px] data flex items-center gap-0.5"
+        style={{ color: PlayerColors[seat].bg, justifyContent: position === 'left' ? 'flex-end' : 'flex-start' }}
+      >
+        {position === 'left' && isLeader && <span style={{ color: 'var(--burgundy)' }}>▸</span>}
+        <span>{seat}</span>
+        {position !== 'left' && isLeader && <span style={{ color: 'var(--burgundy)' }}>▸</span>}
+      </div>
+    );
+  };
+
+  return (
+    <button
+      onClick={() => setShowAnnotation(!showAnnotation)}
+      className="w-full flex items-center gap-2 text-left card-tile rounded p-2"
+      style={{ background: 'var(--paper-2)', border: '1px solid var(--line-soft)' }}
+    >
+      {/* Trick number */}
+      <div className="data display text-[11px]" style={{ color: 'var(--muted)', minWidth: 24, textAlign: 'right' }}>
+        #{trickNum}
+      </div>
+      {/* Cross diamond: 3 stacked rows of [seat-label, slot, seat-label] */}
+      <div className="flex flex-col items-center gap-0.5" style={{ minWidth: 124 }}>
+        <div className="flex items-center gap-1">
+          {seatLabel('N', 'left')}
+          {renderSlot('N')}
+        </div>
+        <div className="flex items-center gap-1">
+          {seatLabel('W', 'left')}
+          {renderSlot('W')}
+          {renderSlot('E')}
+          {seatLabel('E', 'right')}
+        </div>
+        <div className="flex items-center gap-1">
+          {renderSlot('S')}
+          {seatLabel('S', 'right')}
+        </div>
+      </div>
+      {/* Winner annotation */}
+      <div className="flex-1 text-[10px] data" style={{ color: winnerColor, textAlign: 'right' }}>
+        <div>{trick.winner} won</div>
+        {showAnnotation && <div style={{ color: 'var(--muted)' }}>{winnerSide}</div>}
+      </div>
+    </button>
   );
 }
 
@@ -824,19 +926,93 @@ function UnseenGrid({ turnSeat, ledSuit, holders, constraints, onTap, playedCard
   );
 }
 
-function InferencesPanel({ constraints }) {
-  const sum = summarize(constraints);
+/* v2.4: HCP played per seat — sums HCP from constraints.playedBy.
+   Displayed as a row of 4 mini-pills using each seat's brand color. */
+function HcpPlayedRow({ constraints }) {
+  const totals = {};
+  for (const seat of POSITIONS) {
+    let t = 0;
+    for (const c of constraints.playedBy[seat] || []) {
+      t += { A: 4, K: 3, Q: 2, J: 1 }[c.rank] || 0;
+    }
+    totals[seat] = t;
+  }
   return (
-    <div className="card-tile rounded-lg p-3">
-      <div className="text-[10px] uppercase tracking-wider mb-2" style={{ color: 'var(--muted)' }}>What the engine thinks</div>
-      <div className="space-y-1.5">
-        {POSITIONS.map((seat) => (
-          <div key={seat} className="flex items-baseline gap-2 text-xs">
-            <span className="display text-sm w-5" style={{ color: PlayerColors[seat].bg }}>{seat}</span>
-            <span className="data flex-1" style={{ color: 'var(--ink-soft)' }}>{sum[seat]}</span>
-          </div>
-        ))}
-      </div>
+    <div className="flex items-center gap-1.5 text-[11px]">
+      {POSITIONS.map((seat) => (
+        <span
+          key={seat}
+          className="inline-flex items-center gap-1 rounded-full px-2 py-0.5 data"
+          style={{ background: PlayerColors[seat].bg, color: PlayerColors[seat].fg }}
+        >
+          <span style={{ opacity: 0.85 }}>{seat}</span>
+          <span style={{ fontWeight: 600 }}>{totals[seat]}</span>
+        </span>
+      ))}
+    </div>
+  );
+}
+
+/* v2.4: Inferred distribution — collapsible, expanded by default.
+   Per opponent (and partner if not South / dummy if entered):
+     [seat] · ♠ range · ♥ range · ♦ range · ♣ range · HCP remaining: X-Y
+   Length range formatting: "0" if max=0, "5+" if max=13, single number if
+   min=max, otherwise "min-max". */
+function InferredDistribution({ constraints, dummySeat, open, setOpen }) {
+  const fmtLen = (cell) => {
+    if (cell.maxLen === 0) return '0';
+    if (cell.minLen === cell.maxLen) return String(cell.minLen);
+    if (cell.maxLen >= 13) return `${cell.minLen}+`;
+    return `${cell.minLen}-${cell.maxLen}`;
+  };
+  const fmtHCP = (seat) => {
+    const lo = constraints[seat].hcpMin;
+    const hi = constraints[seat].hcpMax;
+    return lo === hi ? `${lo}` : `${lo}-${hi}`;
+  };
+  // Show all four seats EXCEPT South (always known) and dummy (known if entered).
+  const seatsToShow = POSITIONS.filter((s) => s !== 'S' && s !== dummySeat);
+
+  return (
+    <div className="card-tile rounded-lg overflow-hidden">
+      <button
+        onClick={() => setOpen(!open)}
+        className="w-full flex items-center justify-between p-3 text-left"
+      >
+        <div className="flex items-center gap-2">
+          <Info size={14} />
+          <span className="display text-base">Inferred distribution</span>
+          <span className="text-xs data" style={{ color: 'var(--muted)' }}>({seatsToShow.length} unknown)</span>
+        </div>
+        {open ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+      </button>
+      {open && (
+        <div className="px-3 pb-3 pt-1 space-y-2" style={{ borderTop: '1px solid var(--line-soft)' }}>
+          {seatsToShow.length === 0 ? (
+            <div className="text-[11px]" style={{ color: 'var(--muted)' }}>
+              All four hands are known — no inference needed.
+            </div>
+          ) : seatsToShow.map((seat) => (
+            <div key={seat} className="flex items-center gap-2 text-xs flex-wrap">
+              <span
+                className="inline-flex items-center rounded-full px-2 py-0.5 display"
+                style={{ background: PlayerColors[seat].bg, color: PlayerColors[seat].fg, fontSize: 11 }}
+              >
+                {seat}
+              </span>
+              {SUIT_LIST.map((suit) => (
+                <span key={suit} className="flex items-center gap-0.5">
+                  <span className={suit === 'H' || suit === 'D' ? 'red-suit' : 'blk-suit'}>{SYM[suit]}</span>
+                  <span className="data" style={{ color: 'var(--ink-soft)' }}>{fmtLen(constraints[seat][suit])}</span>
+                </span>
+              ))}
+              <span className="data text-[11px] ml-auto" style={{ color: 'var(--muted)' }}>
+                HCP remaining: <span style={{ color: 'var(--ink)' }}>{fmtHCP(seat)}</span>
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
